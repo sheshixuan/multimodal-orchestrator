@@ -2,6 +2,13 @@
 # 复制为 config.toml 并按需修改；也可以直接删除 config.toml，让首次引导自动生成。
 # 注意：API key 只放环境变量（默认 OPENCODE_API_KEY），不要写在这里。
 
+# 全局默认触发模式：auto（命中场景自动执行）或 manual（仅显式点名才执行）
+mode = "auto"
+
+# 按宿主覆盖示例（未列出的宿主用全局 mode；宿主名如 codex/workbudy/claude/opencode）：
+# [hosts.workbudy]
+# mode = "manual"
+
 vision_model = "qwen3.8-max"   # 视觉模块（需支持图片输入，Go 订阅实测可识图）
 review_model = "glm-5.2"       # 评审模块
 core = "self"                  # 核心流程由主代理自处理

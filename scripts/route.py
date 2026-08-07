@@ -7,17 +7,30 @@
   - 否定短语可强制关闭对应模块（图片已实际传入时不会关闭 vision）
   - 其余情况 → 仅 core（主代理自处理）
 
-输出 JSON：{"needs_vision": bool, "needs_review": bool, "core": "self", "reason": "..."}
-主代理可结合上下文对结果做最终判断。
+触发模式（auto / manual，按宿主配置，见 scripts/mode.py）：
+  - 生效模式：hosts.<宿主>.mode → 顶层 mode → auto（读取 config.toml）
+  - enabled = (mode == "auto") or explicit
+  - 最后防线：manual 且未 --explicit 时强制 enabled=false 并告警（即使关键词命中）
+
+输出 JSON：{"needs_vision": bool, "needs_review": bool, "core": "self",
+           "mode": "auto|manual", "explicit": bool, "enabled": bool, "reason": "..."}
+主代理可结合上下文对结果做最终判断；enabled=false 时不得调用任何外部模型。
 
 用法示例：
-  python3 route.py --prompt "帮我看看这张截图并给出方案"
-  python3 route.py --image /path/a.png --prompt "写个方案并评审"
+  python3 route.py --host codex --prompt "帮我看看这张截图并给出方案"
+  python3 route.py --host workbudy --explicit --image /path/a.png --prompt "写个方案并评审"
   echo "帮我写周报" | python3 route.py
 """
 import argparse
 import json
 import sys
+from pathlib import Path
+
+from call_model import load_config
+from mode import resolve_mode
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = SKILL_ROOT / "config.toml"
 
 VISION_KEYWORDS = [
     "图片", "截图", "图表", "图像", "照片", "识图", "OCR", "图中", "图里",
@@ -31,11 +44,12 @@ REVIEW_KEYWORDS = [
 REVIEW_NEGATIONS = ["不用评审", "不需要评审", "不要评审", "免评审", "不用review"]
 
 
-def classify(prompt, images=None):
+def classify(prompt, images=None, mode="auto", explicit=False):
     images = images or []
     prompt = prompt or ""
     prompt_lower = prompt.lower()
     reasons = []
+    enabled = (mode == "auto") or bool(explicit)
 
     needs_vision = bool(images)
     if needs_vision:
@@ -69,6 +83,9 @@ def classify(prompt, images=None):
         "needs_vision": needs_vision,
         "needs_review": needs_review,
         "core": "self",
+        "mode": mode,
+        "explicit": bool(explicit),
+        "enabled": enabled,
         "reason": "；".join(reasons),
     }
 
@@ -80,9 +97,20 @@ def main(argv=None):
     )
     parser.add_argument("--prompt", help="提示词文本；缺省从 stdin 读取")
     parser.add_argument("--image", action="append", default=[], help="图片路径，可多次")
+    parser.add_argument("--host", help="当前宿主名（如 codex/workbudy/claude/opencode）；缺省用全局 mode")
+    parser.add_argument("--explicit", action="store_true", help="用户已显式点名本 skill")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="config.toml 路径")
     args = parser.parse_args(argv)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    result = classify(prompt, args.image)
+    mode = resolve_mode(load_config(args.config), args.host)
+    result = classify(prompt, args.image, mode=mode, explicit=args.explicit)
+    if result["mode"] == "manual" and not result["explicit"]:
+        print(
+            "manual 模式且未显式点名 multimodal-orchestrator："
+            "enabled=false，不执行任何模块、不调用外部模型。"
+            "需要时请说『用 multimodal-orchestrator』。",
+            file=sys.stderr,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

@@ -1,6 +1,6 @@
 ---
 name: multimodal-orchestrator
-description: 三模块流水线编排（vision 图像识别 → core 核心处理 → review 方案评审），让不同模块调用不同模型或 API。当主代理不具备视觉能力、需要转写图片/截图/图表、需要基于图片产出方案、或需要外部模型（如 OpenCode Go/Zen、Gemini）评审方案或交叉核验时使用。首次使用会引导配置模型；用户说"重新配置 multimodal-orchestrator"时重跑引导。
+description: 三模块流水线编排（vision 图像识别 → core 核心处理 → review 方案评审），让不同模块调用不同模型或 API。当主代理不具备视觉能力、需要转写图片/截图/图表、需要基于图片产出方案、或需要外部模型（如 OpenCode Go/Zen、Gemini）评审方案或交叉核验时使用。支持 auto（命中场景自动触发）与 manual（需显式点名）两种触发模式，按宿主（Codex/WorkBuddy 等）分别配置；首次使用会先选择模式再引导配置 API；用户说"重新配置 multimodal-orchestrator"时重跑引导。
 ---
 
 # Multimodal Orchestrator
@@ -14,10 +14,25 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 > 下文 `<skill_dir>` 指 skill 安装目录：Codex 默认 `~/.codex/skills/multimodal-orchestrator/`，
 > 也可位于 `~/.claude/skills/` 或 `~/.config/opencode/skills/` 等任意位置；脚本本身全部用相对路径动态定位，可整体迁移。
 
+## 触发模式（auto / manual）
+
+生效模式由 `config.toml` 决定，解析顺序：`[hosts.<宿主>].mode` → 顶层 `mode` → 默认 `auto`。
+以 `python3 <skill_dir>/scripts/route.py --host <宿主> [--explicit] --prompt "..."` 输出的 `mode` 与 `enabled` 为准。
+
+- **宿主映射**：Codex → `codex`；WorkBuddy → `workbudy`；Claude → `claude`；opencode → `opencode`；
+  不确定当前宿主时不传 `--host`（使用全局默认 mode）。
+- **auto 模式**（默认）：`enabled=true`，命中场景即按下方工作流执行。
+- **manual 模式**：仅当用户**显式点名**本 skill 时才传 `--explicit`（此时 `enabled=true`）：
+  - 点名判定：用户明确提到 `multimodal-orchestrator`、`多模态编排`，或明确说"手动启用/使用本 skill"；
+  - 模糊说法（如"用多模态处理一下""看图给方案"）**不算点名**，不要传 `--explicit`；
+  - 未点名时 **绝对禁止调用任何外部模型**（包括 vision/review 的 `call_model.py`），
+    提示"需要时请说『用 multimodal-orchestrator』"后停止，不消耗任何 API。
+
 ## 工作流
 
-1. **分派**：运行 `python3 <skill_dir>/scripts/route.py --prompt "<用户提示词>" [--image <路径>]`
-   得到 JSON 分派计划，再结合实际上下文做最终判断。规则：含图必走 vision；显式要求评审必走 review；其余仅 core。
+1. **分派**：运行 `python3 <skill_dir>/scripts/route.py --host <当前宿主> [--explicit] --prompt "<用户提示词>" [--image <路径>]`
+   得到 JSON 分派计划（含 `mode`/`enabled`），再结合实际上下文做最终判断；`enabled=false` 时停止，不执行任何模块。
+   规则：含图必走 vision；显式要求评审必走 review；其余仅 core。
 2. **vision（如需要）**：`python3 <skill_dir>/scripts/call_model.py --role vision --image <绝对路径> [--image ...] --prompt "转写需求"`，
    拿到文本转写后继续。模型取自 `config.toml` 的 `vision_model`。
 3. **core**：主代理基于转写/提示词自行推理产出方案；需要落盘时写入文件。

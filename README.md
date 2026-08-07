@@ -31,6 +31,16 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
 方式三（其他工具）：把仓库内容拷贝到 `~/.claude/skills/multimodal-orchestrator/` 或
 `~/.config/opencode/skills/multimodal-orchestrator/` 即可（目录格式与 bash 脚本执行两者通用）。
 
+## 触发模式（auto / manual）
+
+- `auto`（默认）：命中图片/评审等场景时自动分派执行。
+- `manual`：仅当用户**显式点名**（提到 `multimodal-orchestrator`、`多模态编排` 或"手动启用/使用本 skill"）才执行；
+  未点名时严格停止、不调用任何外部模型、不消耗 API。
+- 按宿主配置：`config.toml` 顶层 `mode` 为全局默认，`[hosts.<宿主>]` 可单独覆盖
+  （如 `[hosts.codex] mode = "auto"`、`[hosts.workbudy] mode = "manual"`）；宿主名对应
+  Codex→`codex`、WorkBuddy→`workbudy`、Claude→`claude`、opencode→`opencode`。
+- 切换模式：说"重新配置 multimodal-orchestrator"重跑引导，或直接编辑 `config.toml` 的 `mode`。
+
 ## 首次使用
 
 1. 设置 API key 环境变量（不落盘、不写入任何文件）：
@@ -39,7 +49,8 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
    export OPENCODE_API_KEY="你的 OpenCode Go/Zen key"
    ```
 
-2. 首次触发 skill 时会按 vision / review / core 三模块引导配置，自动生成 `config.toml`；
+2. 首次触发 skill 时会先询问**触发模式**（统一或按宿主选择 auto/manual），
+   再按 vision / review / core 三模块引导配置 API，自动生成 `config.toml`；
    也可以参考仓库里的 `config.example.toml` 手工创建。
 3. 引导会运行 `scripts/call_model.py --check-key` 做健康检查（Go 订阅探测 / Zen 余额探测）。
 4. 想重跑引导：直接说"重新配置 multimodal-orchestrator"。
@@ -47,8 +58,8 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
 ## 使用示例
 
 ```
-# 分派（可选，用于确认模块组合）
-python3 <skill_dir>/scripts/route.py --image /path/a.png --prompt "看图后给方案并评审"
+# 分派（可选，用于确认模块组合；manual 模式未点名时 enabled=false）
+python3 <skill_dir>/scripts/route.py --host codex --image /path/a.png --prompt "看图后给方案并评审"
 
 # vision：转写图片
 python3 <skill_dir>/scripts/call_model.py --role vision --image /path/a.png --prompt "转写这张图"

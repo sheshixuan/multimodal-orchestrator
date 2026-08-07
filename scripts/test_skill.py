@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import call_model
+import mode
 import route
 
 
@@ -305,6 +306,91 @@ class TestCheckKey(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             rc = call_model.run_check_key(self._args(), {}, providers)
         self.assertEqual(rc, 2)
+
+
+class TestModeResolution(unittest.TestCase):
+    def test_default_auto_no_config(self):
+        self.assertEqual(mode.resolve_mode({}, "codex"), "auto")
+        self.assertEqual(mode.resolve_mode({}, None), "auto")
+
+    def test_host_override_precedence(self):
+        cfg = {"mode": "auto", "hosts": {"workbudy": {"mode": "manual"}}}
+        self.assertEqual(mode.resolve_mode(cfg, "workbudy"), "manual")
+        self.assertEqual(mode.resolve_mode(cfg, "codex"), "auto")  # 未列出 → 顶层
+        self.assertEqual(mode.resolve_mode(cfg, None), "auto")
+
+    def test_top_level_manual_fallback(self):
+        cfg = {"mode": "manual"}
+        self.assertEqual(mode.resolve_mode(cfg, "codex"), "manual")
+        self.assertEqual(mode.resolve_mode(cfg, None), "manual")
+
+    def test_old_config_without_mode(self):
+        cfg = {"vision_model": "qwen3.8-max", "review_model": "glm-5.2", "core": "self"}
+        self.assertEqual(mode.resolve_mode(cfg, "codex"), "auto")
+
+
+class TestRouteMode(unittest.TestCase):
+    def _run(self, config_text, prompt, extra=None):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = os.path.join(d, "config.toml")
+            if config_text:
+                Path(cfg_path).write_text(config_text, encoding="utf-8")
+            argv = ["--prompt", prompt, "--config", cfg_path] + (extra or [])
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = route.main(argv)
+            return rc, json.loads(stdout.getvalue()), stderr.getvalue()
+
+    def test_manual_not_explicit_disabled(self):
+        rc, result, err = self._run('mode = "manual"\n', "帮我看看这张截图并给方案")
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["mode"], "manual")
+        self.assertFalse(result["enabled"])
+        self.assertIn("manual 模式且未显式点名", err)
+
+    def test_manual_explicit_enabled(self):
+        rc, result, err = self._run(
+            'mode = "manual"\n', "用 multimodal-orchestrator 看这张截图", ["--explicit"]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["mode"], "manual")
+        self.assertTrue(result["explicit"])
+        self.assertTrue(result["enabled"])
+        self.assertNotIn("enabled=false", err)
+
+    def test_auto_enabled(self):
+        rc, result, err = self._run('mode = "auto"\n', "帮我看看这张截图并给方案")
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["mode"], "auto")
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["needs_vision"])
+
+    def test_host_override_in_route(self):
+        cfg = 'mode = "manual"\n\n[hosts.codex]\nmode = "auto"\n'
+        _, result_codex, _ = self._run(cfg, "看图", ["--host", "codex"])
+        self.assertEqual(result_codex["mode"], "auto")
+        self.assertTrue(result_codex["enabled"])
+        _, result_wb, _ = self._run(cfg, "看图", ["--host", "workbudy"])
+        self.assertEqual(result_wb["mode"], "manual")
+        self.assertFalse(result_wb["enabled"])
+
+    def test_backward_compat_no_mode_no_host(self):
+        rc, result, err = self._run(None, "帮我写一份周报")
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["mode"], "auto")
+        self.assertTrue(result["enabled"])
+        self.assertFalse(result["needs_vision"])
+        self.assertFalse(result["needs_review"])
+        self.assertEqual(result["core"], "self")
+
+    def test_old_config_format_no_mode(self):
+        rc, result, _ = self._run(
+            'vision_model = "qwen3.8-max"\nreview_model = "glm-5.2"\ncore = "self"\n',
+            "看图给方案",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["mode"], "auto")
+        self.assertTrue(result["enabled"])
 
 
 if __name__ == "__main__":
