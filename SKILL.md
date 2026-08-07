@@ -1,6 +1,6 @@
 ---
 name: multimodal-orchestrator
-description: 三模块流水线编排（vision 图像识别 → core 核心处理 → review 方案评审），让不同模块调用不同模型或 API。当主代理不具备视觉能力、需要转写图片/截图/图表、需要基于图片产出方案、或需要外部模型（如 OpenCode Go/Zen、Gemini）评审方案或交叉核验时使用。支持 auto（命中场景自动触发）与 manual（需显式点名）两种触发模式，按宿主（Codex/WorkBuddy 等）分别配置；首次使用会先选择模式再引导配置 API；用户说"重新配置 multimodal-orchestrator"时重跑引导。
+description: 三模块流水线编排（vision 图像识别 → core 核心处理 → review 方案评审），让不同模块调用不同模型或 API。当主代理不具备视觉能力、需要转写图片/截图/图表、需要基于图片产出方案、或需要外部模型（如 OpenCode Go/Zen、Gemini）评审方案或交叉核验时使用。支持 auto（命中场景自动触发）与 manual（需提及式调用）两种触发模式，按宿主（Codex/WorkBuddy 等）分别配置；首次使用会先选择模式再引导配置 API；用户说"重新配置 multimodal-orchestrator"时重跑引导。
 ---
 
 # Multimodal Orchestrator
