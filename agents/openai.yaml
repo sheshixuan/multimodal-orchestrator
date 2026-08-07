@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multimodal Orchestrator"
+  short_description: "Route tasks to vision, core, and review modules"
+  default_prompt: "Use $multimodal-orchestrator to transcribe an image and review the plan with external models."

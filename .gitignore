@@ -1,0 +1,6 @@
+# 本地运行时配置（不发布；首次引导会自动生成）
+config.toml
+
+__pycache__/
+*.pyc
+.DS_Store
