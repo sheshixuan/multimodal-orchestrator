@@ -46,3 +46,7 @@
    如需自定义 provider，按 `references/model_presets.md` 增加 `[providers.xxx]`。
 6. **继续原任务**：回到分派流程（`scripts/route.py --host <当前宿主> [--explicit]` → 执行各模块）
    处理用户最初的请求。
+
+> 之后想随时切换 auto/manual（含按宿主），无需重跑引导，直接运行
+> `python3 <skill_dir>/scripts/mode.py --set auto|manual [--host <宿主>]`；
+> `--unset-host <宿主>` 可移除某宿主的覆盖回退全局。

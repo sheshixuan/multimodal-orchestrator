@@ -416,6 +416,84 @@ class TestRouteMode(unittest.TestCase):
         self.assertIn("manual 模式且未显式点名", err)
 
 
+class TestModeSet(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _config(self, text):
+        path = os.path.join(self.tmpdir, "config.toml")
+        Path(path).write_text(text, encoding="utf-8")
+        return path
+
+    def test_set_global_replaces_preserving_others(self):
+        path = self._config('# comment\nmode = "auto"\n\nvision_model = "qwen3.8-max"\n')
+        mode.set_mode(path, "manual")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn('# comment', text)
+        self.assertIn('mode = "manual"', text)
+        self.assertIn('vision_model = "qwen3.8-max"', text)
+        self.assertEqual(mode.resolve_mode(mode.load_config(path), None), "manual")
+
+    def test_set_global_inserts_when_missing(self):
+        path = self._config('vision_model = "qwen3.8-max"\n')
+        mode.set_mode(path, "manual")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn('mode = "manual"', text)
+        self.assertEqual(mode.resolve_mode(mode.load_config(path), None), "manual")
+
+    def test_set_host_existing_section(self):
+        path = self._config(
+            'mode = "auto"\n\n[hosts.codex]\nmode = "auto"\n\n[hosts.workbudy]\nmode = "manual"\n'
+        )
+        mode.set_mode(path, "manual", host="codex")
+        cfg = mode.load_config(path)
+        self.assertEqual(mode.resolve_mode(cfg, "codex"), "manual")
+        self.assertEqual(mode.resolve_mode(cfg, "workbudy"), "manual")
+
+    def test_set_host_new_section(self):
+        path = self._config('mode = "auto"\n')
+        mode.set_mode(path, "manual", host="codex")
+        cfg = mode.load_config(path)
+        self.assertEqual(mode.resolve_mode(cfg, "codex"), "manual")
+        self.assertEqual(mode.resolve_mode(cfg, "workbudy"), "auto")
+
+    def test_set_missing_config_raises(self):
+        with self.assertRaises(mode.ConfigError):
+            mode.set_mode(os.path.join(self.tmpdir, "nope.toml"), "manual")
+
+    def test_set_invalid_mode_raises(self):
+        path = self._config('mode = "auto"\n')
+        with self.assertRaises(mode.ConfigError):
+            mode.set_mode(path, "turbo")
+
+    def test_unset_host_falls_back_to_global(self):
+        path = self._config('mode = "auto"\n\n[hosts.codex]\nmode = "manual"\n')
+        mode.unset_host_mode(path, "codex")
+        self.assertEqual(mode.resolve_mode(mode.load_config(path), "codex"), "auto")
+
+    def test_unset_host_missing_section_noop(self):
+        path = self._config('mode = "auto"\n')
+        mode.unset_host_mode(path, "codex")
+        self.assertEqual(mode.resolve_mode(mode.load_config(path), "codex"), "auto")
+
+    def test_set_cli_roundtrip(self):
+        path = self._config('mode = "auto"\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = mode.main(["--config", path, "--set", "manual", "--host", "codex"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hosts.codex mode = manual", stdout.getvalue())
+        self.assertEqual(mode.resolve_mode(mode.load_config(path), "codex"), "manual")
+
+    def test_set_and_unset_conflict(self):
+        path = self._config('mode = "auto"\n')
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = mode.main(["--config", path, "--set", "manual", "--unset-host", "codex"])
+        self.assertEqual(rc, 3)
+        self.assertIn("不能同时使用", stderr.getvalue())
+
+
 class TestMentionDetection(unittest.TestCase):
     def test_symbol_mentions(self):
         for prompt in (

@@ -41,7 +41,15 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
 - 按宿主配置：`config.toml` 顶层 `mode` 为全局默认，`[hosts.<宿主>]` 可单独覆盖
   （如 `[hosts.codex] mode = "auto"`、`[hosts.workbudy] mode = "manual"`）；宿主名对应
   Codex→`codex`、WorkBuddy→`workbudy`、Claude→`claude`、opencode→`opencode`。
-- 切换模式：说"重新配置 multimodal-orchestrator"重跑引导，或直接编辑 `config.toml` 的 `mode`。
+- 切换模式（随时生效，无需重跑引导）：
+
+  ```
+  python3 <skill_dir>/scripts/mode.py --set manual              # 全局切 manual
+  python3 <skill_dir>/scripts/mode.py --set auto --host codex   # 仅 Codex 切 auto
+  python3 <skill_dir>/scripts/mode.py --unset-host codex        # 移除覆盖，回退全局
+  ```
+
+  想重跑完整引导（重新选模式/模型）再说"重新配置 multimodal-orchestrator"。
 
 ## 首次使用
 

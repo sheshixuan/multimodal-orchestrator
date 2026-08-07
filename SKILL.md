@@ -21,6 +21,10 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 
 - **宿主映射**：Codex → `codex`；WorkBuddy → `workbudy`；Claude → `claude`；opencode → `opencode`；
   不确定当前宿主时不传 `--host`（使用全局默认 mode）。
+- **随时切换**：无需重跑引导。用户说"切换到 manual/auto 模式"或"把 Codex 切成 manual"时，
+  运行 `python3 <skill_dir>/scripts/mode.py --set <auto|manual> [--host <宿主>]` 即时生效
+  （行级写入，保留注释与其他配置）；`--unset-host <宿主>` 可移除某宿主覆盖回退全局。
+  此类模式管理请求即使当前为 manual 模式也直接执行（只改本地配置，不调用外部模型）。
 - **auto 模式**（默认）：`enabled=true`，命中场景即按下方工作流执行。
 - **manual 模式**：仅当用户**提及**本 skill 时才执行。`route.py` 自动识别提及
   （输出 `mention_detected: true` → `explicit=true`），主代理无需再传 `--explicit`（仅作兜底）：
@@ -56,6 +60,7 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 3. 把 `vision_model`/`review_model`/`core` 写入 `config.toml`（key 不落盘），然后继续原任务。
 
 用户说"重新配置 multimodal-orchestrator"时，重跑上述引导。
+仅切换 auto/manual 模式不用重跑引导，用上面的 `mode.py --set` 即可。
 
 ## 配置与预设
 
