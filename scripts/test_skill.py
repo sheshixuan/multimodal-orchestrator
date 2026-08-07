@@ -392,6 +392,84 @@ class TestRouteMode(unittest.TestCase):
         self.assertEqual(result["mode"], "auto")
         self.assertTrue(result["enabled"])
 
+    def test_manual_mention_enabled(self):
+        rc, result, err = self._run('mode = "manual"\n', "用 @multimodal-orchestrator 看这张截图")
+        self.assertEqual(rc, 0)
+        self.assertTrue(result["mention_detected"])
+        self.assertTrue(result["explicit"])
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["clean_prompt"], "用 multimodal-orchestrator 看这张截图")
+        self.assertNotIn("enabled=false", err)
+
+    def test_manual_plain_name_enabled(self):
+        rc, result, _ = self._run('mode = "manual"\n', "用 multimodal-orchestrator 写个方案")
+        self.assertEqual(rc, 0)
+        self.assertTrue(result["mention_detected"])
+        self.assertTrue(result["enabled"])
+
+    def test_manual_negated_mention_disabled(self):
+        rc, result, err = self._run('mode = "manual"\n', "不要用 multimodal-orchestrator 处理")
+        self.assertEqual(rc, 0)
+        self.assertFalse(result["mention_detected"])
+        self.assertFalse(result["explicit"])
+        self.assertFalse(result["enabled"])
+        self.assertIn("manual 模式且未显式点名", err)
+
+
+class TestMentionDetection(unittest.TestCase):
+    def test_symbol_mentions(self):
+        for prompt in (
+            "用 $multimodal-orchestrator 看这张图",
+            "用 @multimodal-orchestrator 看这张图",
+            "用 @ multimodal-orchestrator 看这张图",
+            "用 $  multimodal-orchestrator 看这张图",
+            "用 @Multimodal-Orchestrator 看这张图",
+        ):
+            self.assertTrue(route.detect_mention(prompt), prompt)
+
+    def test_chinese_mention(self):
+        self.assertTrue(route.detect_mention("用多模态编排处理这张图"))
+
+    def test_plain_name_mention(self):
+        self.assertTrue(route.detect_mention("用 multimodal-orchestrator 看这张图"))
+
+    def test_boundary_and_unrelated_not_mention(self):
+        self.assertFalse(route.detect_mention("xmultimodal-orchestratory 处理一下"))
+        self.assertFalse(route.detect_mention("看看这张图，给个方案"))
+        self.assertFalse(route.detect_mention(""))
+
+    def test_negation_not_mention(self):
+        for prompt in (
+            "不要用 multimodal-orchestrator 处理",
+            "不用 multimodal-orchestrator 了",
+            "别用 multimodal-orchestrator",
+            "别再用 multimodal-orchestrator",
+            "不需要 multimodal-orchestrator",
+        ):
+            self.assertFalse(route.detect_mention(prompt), prompt)
+
+    def test_discussion_not_mention(self):
+        for prompt in (
+            "什么是 multimodal-orchestrator？",
+            "介绍一下 multimodal-orchestrator",
+            "讲讲 multimodal-orchestrator",
+            "说说 multimodal-orchestrator",
+            "评价一下 multimodal-orchestrator",
+        ):
+            self.assertFalse(route.detect_mention(prompt), prompt)
+
+    def test_clean_mentions(self):
+        self.assertEqual(
+            route.clean_mentions("用 @multimodal-orchestrator 看这张图"),
+            "用 multimodal-orchestrator 看这张图",
+        )
+        self.assertEqual(
+            route.clean_mentions("用 $ multimodal-orchestrator 处理"),
+            "用 multimodal-orchestrator 处理",
+        )
+        self.assertEqual(route.clean_mentions("帮我看看这张图"), "帮我看看这张图")
+        self.assertEqual(route.clean_mentions(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

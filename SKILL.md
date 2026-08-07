@@ -22,16 +22,23 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 - **宿主映射**：Codex → `codex`；WorkBuddy → `workbudy`；Claude → `claude`；opencode → `opencode`；
   不确定当前宿主时不传 `--host`（使用全局默认 mode）。
 - **auto 模式**（默认）：`enabled=true`，命中场景即按下方工作流执行。
-- **manual 模式**：仅当用户**显式点名**本 skill 时才传 `--explicit`（此时 `enabled=true`）：
-  - 点名判定：用户明确提到 `multimodal-orchestrator`、`多模态编排`，或明确说"手动启用/使用本 skill"；
-  - 模糊说法（如"用多模态处理一下""看图给方案"）**不算点名**，不要传 `--explicit`；
+- **manual 模式**：仅当用户**提及**本 skill 时才执行。`route.py` 自动识别提及
+  （输出 `mention_detected: true` → `explicit=true`），主代理无需再传 `--explicit`（仅作兜底）：
+  - **提及形式**：Codex 用 `$multimodal-orchestrator`（也可用 `/skills` 选择）；ChatGPT/WorkBuddy 用
+    `@multimodal-orchestrator`（`$`/`@` 后容忍空格、大小写不敏感）；纯名称 `multimodal-orchestrator`
+    或中文名 `多模态编排` 也算点名；
+  - **不算点名**：否定/讨论性提及（如"不要用 multimodal-orchestrator""什么是 multimodal-orchestrator"、
+    "介绍一下 multimodal-orchestrator"）以及模糊说法（如"用多模态处理一下""看图给方案"）；
   - 未点名时 **绝对禁止调用任何外部模型**（包括 vision/review 的 `call_model.py`），
-    提示"需要时请说『用 multimodal-orchestrator』"后停止，不消耗任何 API。
+    提示"需要时请提及：Codex 用 $multimodal-orchestrator，ChatGPT/WorkBuddy 用 @multimodal-orchestrator"
+    后停止，不消耗任何 API。
 
 ## 工作流
 
 1. **分派**：运行 `python3 <skill_dir>/scripts/route.py --host <当前宿主> [--explicit] --prompt "<用户提示词>" [--image <路径>]`
-   得到 JSON 分派计划（含 `mode`/`enabled`），再结合实际上下文做最终判断；`enabled=false` 时停止，不执行任何模块。
+   得到 JSON 分派计划（含 `mode`/`enabled`/`mention_detected`/`clean_prompt`），再结合实际上下文做最终判断；
+   `enabled=false` 时停止，不执行任何模块；构造 vision/review 提示词时使用 `clean_prompt`
+   （已剥离 `$`/`@` 符号）而非含符号的原始文本。
    规则：含图必走 vision；显式要求评审必走 review；其余仅 core。
 2. **vision（如需要）**：`python3 <skill_dir>/scripts/call_model.py --role vision --image <绝对路径> [--image ...] --prompt "转写需求"`，
    拿到文本转写后继续。模型取自 `config.toml` 的 `vision_model`。

@@ -10,7 +10,11 @@
    - 统一：确认一个模式（推荐 `auto`），写入顶层 `mode`；
    - 分别：逐个询问各宿主用 `auto` 还是 `manual`（如 Codex=auto、WorkBuddy=manual），
      写入 `[hosts.<宿主>]` 段；用户未提及的宿主用全局默认（推荐 `auto`）。
-   - 说明：`manual` 模式下，只有用户显式点名本 skill 才会执行，未点名时绝不调用外部模型。
+   - 说明：`manual` 模式下，只有用户**提及**本 skill 才会执行（route.py 自动识别，
+     输出 `mention_detected: true`）：Codex 用 `$multimodal-orchestrator`（或 `/skills` 选择）、
+     ChatGPT/WorkBuddy 用 `@multimodal-orchestrator`，直接说名称 `multimodal-orchestrator`
+     或中文名 `多模态编排` 也算；否定/讨论性提及（如"不要用/什么是 multimodal-orchestrator"）
+     不算点名。未提及时绝不调用外部模型、不消耗 API。
 2. **确认三模块模型**（逐一询问，附推荐项）：
    - vision：推荐从 OpenCode Go 模型列表选 `qwen3.8-max`（实测可识图）或 `mimo-v2.5`（备选，reasoning 型需给足 max_tokens）。
    - review：推荐 `glm-5.2`（评审稳健）或 `kimi-k3` / `deepseek-v4-pro`。

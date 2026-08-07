@@ -9,20 +9,27 @@
 
 触发模式（auto / manual，按宿主配置，见 scripts/mode.py）：
   - 生效模式：hosts.<宿主>.mode → 顶层 mode → auto（读取 config.toml）
+  - 提及检测：route.py 自动识别提示词中的显式点名（$multimodal-orchestrator /
+    @multimodal-orchestrator / 纯名称 multimodal-orchestrator / 中文名 多模态编排），
+    命中即 explicit=true（输出 mention_detected=true）；--explicit 仅作兜底
+  - 否定/讨论性提及（如"不要用/什么是 multimodal-orchestrator"）不算点名
   - enabled = (mode == "auto") or explicit
-  - 最后防线：manual 且未 --explicit 时强制 enabled=false 并告警（即使关键词命中）
+  - 最后防线：manual 且未点名时强制 enabled=false 并告警（即使关键词命中）
 
 输出 JSON：{"needs_vision": bool, "needs_review": bool, "core": "self",
-           "mode": "auto|manual", "explicit": bool, "enabled": bool, "reason": "..."}
+           "mode": "auto|manual", "explicit": bool, "enabled": bool,
+           "mention_detected": bool, "clean_prompt": str, "reason": "..."}
 主代理可结合上下文对结果做最终判断；enabled=false 时不得调用任何外部模型。
 
 用法示例：
   python3 route.py --host codex --prompt "帮我看看这张截图并给出方案"
   python3 route.py --host workbudy --explicit --image /path/a.png --prompt "写个方案并评审"
+  echo "用 @multimodal-orchestrator 看这张截图" | python3 route.py --host codex
   echo "帮我写周报" | python3 route.py
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -42,6 +49,42 @@ REVIEW_KEYWORDS = [
     "核对一下", "检查一下方案", "方案评审", "再检查", "review", "挑刺",
 ]
 REVIEW_NEGATIONS = ["不用评审", "不需要评审", "不要评审", "免评审", "不用review"]
+
+# 提及式点名检测（大小写不敏感）：
+#   $/@ + 可选空格 + 名称（Codex 用 $，ChatGPT/WorkBuddy 用 @）
+MENTION_SYMBOL_RE = re.compile(r"[$@]\s*multimodal-orchestrator", re.IGNORECASE)
+# 纯名称：要求两侧单词边界，避免 xmultimodal-orchestratory 之类子串误命中
+MENTION_NAME_RE = re.compile(
+    r"(?<![a-z0-9])multimodal-orchestrator(?![a-z0-9])", re.IGNORECASE
+)
+# 纯名称前 12 字符内出现以下否定/讨论短语时不算点名
+DISMISS_PHRASES = [
+    "不要用", "不用", "别用", "别再用", "不需要", "不用了",
+    "什么是", "介绍一下", "讲讲", "说说", "评价一下",
+]
+
+
+def detect_mention(prompt):
+    """检测提示词是否显式提及本 skill（$/@/纯名称/中文名），返回 bool。
+
+    优先级：$/@ 符号提及、中文名 多模态编排 直接算点名；纯名称受单词边界约束，
+    且提及前 12 字符内出现否定/讨论短语（如"不要用/什么是 multimodal-orchestrator"）不算点名。
+    """
+    prompt = prompt or ""
+    if MENTION_SYMBOL_RE.search(prompt) or "多模态编排" in prompt:
+        return True
+    match = MENTION_NAME_RE.search(prompt)
+    if not match:
+        return False
+    before = prompt[max(0, match.start() - 12): match.start()]
+    return not any(phrase in before for phrase in DISMISS_PHRASES)
+
+
+def clean_mentions(prompt):
+    """把 $/@ 提及符号剥离为纯名称（如 @multimodal-orchestrator -> multimodal-orchestrator），
+    供传给 vision/review 等下游模型时使用，避免符号干扰。"""
+    prompt = prompt or ""
+    return MENTION_SYMBOL_RE.sub("multimodal-orchestrator", prompt)
 
 
 def classify(prompt, images=None, mode="auto", explicit=False):
@@ -103,12 +146,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     mode = resolve_mode(load_config(args.config), args.host)
-    result = classify(prompt, args.image, mode=mode, explicit=args.explicit)
+    mention_detected = detect_mention(prompt)
+    explicit = args.explicit or mention_detected
+    result = classify(prompt, args.image, mode=mode, explicit=explicit)
+    result["mention_detected"] = mention_detected
+    result["clean_prompt"] = clean_mentions(prompt)
     if result["mode"] == "manual" and not result["explicit"]:
         print(
             "manual 模式且未显式点名 multimodal-orchestrator："
             "enabled=false，不执行任何模块、不调用外部模型。"
-            "需要时请说『用 multimodal-orchestrator』。",
+            "需要时请在提示词中提及：Codex 用 $multimodal-orchestrator，"
+            "ChatGPT/WorkBuddy 用 @multimodal-orchestrator，或直接说名称/多模态编排。",
             file=sys.stderr,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))

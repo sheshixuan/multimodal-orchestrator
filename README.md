@@ -34,8 +34,10 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
 ## 触发模式（auto / manual）
 
 - `auto`（默认）：命中图片/评审等场景时自动分派执行。
-- `manual`：仅当用户**显式点名**（提到 `multimodal-orchestrator`、`多模态编排` 或"手动启用/使用本 skill"）才执行；
-  未点名时严格停止、不调用任何外部模型、不消耗 API。
+- `manual`：仅当用户**提及**本 skill 才执行（`route.py` 自动识别，输出 `mention_detected: true`）：
+  Codex 用 `$multimodal-orchestrator`（或 `/skills` 选择）、ChatGPT/WorkBuddy 用 `@multimodal-orchestrator`，
+  直接说名称 `multimodal-orchestrator` 或中文名 `多模态编排` 也算；否定/讨论性提及
+  （如"不要用/什么是 multimodal-orchestrator"）不算点名。未点名时严格停止、不调用任何外部模型、不消耗 API。
 - 按宿主配置：`config.toml` 顶层 `mode` 为全局默认，`[hosts.<宿主>]` 可单独覆盖
   （如 `[hosts.codex] mode = "auto"`、`[hosts.workbudy] mode = "manual"`）；宿主名对应
   Codex→`codex`、WorkBuddy→`workbudy`、Claude→`claude`、opencode→`opencode`。
