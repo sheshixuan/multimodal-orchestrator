@@ -1,6 +1,6 @@
 # multimodal-orchestrator
 
-一个 Codex skill：三模块流水线编排 **vision 图像识别 → core 核心处理 → review 方案评审**，
+一个给deepseek V4 Flash装上眼睛的 Codex skill：三模块流水线编排 **vision 图像识别 → core 核心处理 → review 方案评审**，
 让每个模块调用不同的模型或 API。当主代理不具备视觉能力（如 DeepSeek 文本模型）、需要转写图片/截图/图表、
 需要基于图片产出方案、或需要外部模型评审方案/交叉核验时使用。
 
