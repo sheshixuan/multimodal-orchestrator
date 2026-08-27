@@ -1,4 +1,4 @@
 interface:
   display_name: "Multimodal Orchestrator"
-  short_description: "Route tasks to vision, core, and review modules"
-  default_prompt: "Use $multimodal-orchestrator to transcribe an image and review the plan with external models."
+  short_description: "Route vision, core, and review modules; gate Codex Plan finalization"
+  default_prompt: "Use $multimodal-orchestrator to transcribe an image, review plans with external models, and run the Codex Plan Review Gate."

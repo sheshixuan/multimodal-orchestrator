@@ -5,6 +5,13 @@
 # 全局默认触发模式：auto（命中场景自动执行）或 manual（仅提及才执行）
 mode = "auto"
 
+# Codex Plan 模式收尾评审门（安装 scripts/install_plan_hook.py 后生效）：
+# ask = 每次 plan 收尾先完成实施计划并准备 review 计划，最后一步同时展示并让用户选评审模型（默认，缺失时视为 ask）；
+# auto = 不询问，直接用 review_model 自动评审；
+# off = 关闭。
+# 旧值 true/false 兼容为 ask/off。
+plan_review = "ask"
+
 # 按宿主覆盖示例（未列出的宿主用全局 mode；宿主名如 codex/workbudy/claude/opencode）：
 # [hosts.workbudy]
 # mode = "manual"
@@ -16,3 +23,13 @@ mode = "auto"
 vision_model = "qwen3.8-max"   # 视觉模块（需支持图片输入，Go 订阅实测可识图）
 review_model = "glm-5.2"       # 评审模块
 core = "self"                  # 核心流程由主代理自处理
+
+# 可选：向 Plan Review 候选列表追加多个 provider 的模型；内置候选保留，重复项自动去重。
+[review_models]
+opencode_go = "glm-5.2"
+# private_proxy = "myproxy:review-model"
+
+# 自定义 provider 示例（API key 本身只放 MY_PROXY_API_KEY 环境变量）：
+# [providers.myproxy]
+# base_url = "https://your-proxy.example.com/v1"
+# env = "MY_PROXY_API_KEY"

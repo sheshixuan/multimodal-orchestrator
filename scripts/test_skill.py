@@ -18,7 +18,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import call_model
+import install_plan_hook
 import mode
+import plan_review_hook
+import review_plan
 import route
 
 
@@ -34,6 +37,7 @@ class TestTomlParser(unittest.TestCase):
 vision_model = "gemini-3.5-flash"
 review_model = 'gemini-3.1-pro'
 core = "self"
+plan_review = true
 
 [providers.myproxy]
 base_url = "https://proxy.example.com/v1"
@@ -43,6 +47,7 @@ env = "MY_KEY"
         self.assertEqual(cfg["vision_model"], "gemini-3.5-flash")
         self.assertEqual(cfg["review_model"], "gemini-3.1-pro")
         self.assertEqual(cfg["core"], "self")
+        self.assertIs(cfg["plan_review"], True)
         self.assertEqual(cfg["providers"]["myproxy"]["base_url"], "https://proxy.example.com/v1")
         self.assertEqual(cfg["providers"]["myproxy"]["env"], "MY_KEY")
 
@@ -103,10 +108,24 @@ class TestProviderResolution(unittest.TestCase):
             call_model.resolve_provider("gemini:gemini-2.5-flash", self.providers),
             ("gemini", "gemini-2.5-flash"),
         )
+        providers = call_model.build_providers(
+            {
+                "providers": {
+                    "myproxy": {
+                        "base_url": "https://proxy.example.com/v1",
+                        "env": "MY_KEY",
+                    }
+                }
+            }
+        )
         self.assertEqual(
-            call_model.resolve_provider("myproxy:foo", self.providers),
+            call_model.resolve_provider("myproxy:foo", providers),
             ("myproxy", "foo"),
         )
+
+    def test_unknown_explicit_provider_rejected(self):
+        with self.assertRaises(call_model.ConfigError):
+            call_model.resolve_provider("missing-provider:foo", self.providers)
 
     def test_unknown_model(self):
         with self.assertRaises(call_model.ConfigError):
@@ -232,6 +251,19 @@ class TestCallModel(unittest.TestCase):
             config = os.path.join(d, "config.toml")
             rc = call_model.main(["--role", "vision", "--prompt", "x", "--config", config])
             self.assertEqual(rc, 3)
+
+    def test_malformed_providers_exit3(self):
+        with tempfile.TemporaryDirectory() as d:
+            config = os.path.join(d, "config.toml")
+            Path(config).write_text('providers = "not-a-table"\n', encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                try:
+                    rc = call_model.main(["--list-presets", "--config", config])
+                except Exception as exc:
+                    self.fail(f"CLI leaked an exception instead of a config error: {exc}")
+            self.assertEqual(rc, 3)
+            self.assertIn("providers", stderr.getvalue())
 
     def test_missing_key_exit2(self):
         with tempfile.TemporaryDirectory() as d:
@@ -547,6 +579,274 @@ class TestMentionDetection(unittest.TestCase):
         )
         self.assertEqual(route.clean_mentions("帮我看看这张图"), "帮我看看这张图")
         self.assertEqual(route.clean_mentions(""), "")
+
+
+class TestReviewPlan(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _config(self, text):
+        path = os.path.join(self.tmpdir, "config.toml")
+        Path(path).write_text(text, encoding="utf-8")
+        return path
+
+    def test_candidates_resolve_to_known_providers(self):
+        providers = call_model.build_providers({})
+        for item in review_plan.REVIEW_MODELS:
+            provider, _ = call_model.resolve_provider(item["model"], providers)
+            self.assertIn(provider, providers)
+
+    def test_list_models_merges_local_provider_candidates(self):
+        cfg = call_model.parse_toml_simple(
+            'review_model = "glm-5.2"\n'
+            '\n[providers.bailian-token-plan]\n'
+            'base_url = "https://token-plan.example/v1"\n'
+            'env = "BAILIAN_TOKEN_PLAN_API_KEY"\n'
+            '\n[review_models]\n'
+            'opencode_go = "glm-5.2"\n'
+            'bailian_token_plan = "bailian-token-plan:glm-5.2"\n'
+        )
+        providers = call_model.build_providers(cfg)
+
+        items = review_plan.list_models(cfg, providers)
+        models = [item["model"] for item in items]
+
+        self.assertEqual(models.count("glm-5.2"), 1)
+        self.assertIn("bailian-token-plan:glm-5.2", models)
+        bailian = next(
+            item for item in items
+            if item["model"] == "bailian-token-plan:glm-5.2"
+        )
+        self.assertEqual(bailian["provider"], "bailian-token-plan")
+        self.assertEqual(bailian["note"], "本地配置：bailian_token_plan")
+        self.assertFalse(bailian["current"])
+
+    def test_set_review_model_preserves_other_lines(self):
+        path = self._config(
+            '# comment\nmode = "manual"\nplan_review = true\n\n'
+            'vision_model = "qwen3.8-max"\nreview_model = "glm-5.2"\ncore = "self"\n'
+        )
+        review_plan.set_review_model(path, "kimi-k3")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("# comment", text)
+        self.assertIn('mode = "manual"', text)
+        self.assertIn("plan_review = true", text)
+        self.assertIn('vision_model = "qwen3.8-max"', text)
+        self.assertIn('review_model = "kimi-k3"', text)
+        cfg = call_model.load_config(path)
+        self.assertEqual(cfg["review_model"], "kimi-k3")
+
+    def test_set_review_model_inserts_when_missing(self):
+        path = self._config('mode = "auto"\n')
+        review_plan.set_review_model(path, "deepseek-v4-pro")
+        cfg = call_model.load_config(path)
+        self.assertEqual(cfg["review_model"], "deepseek-v4-pro")
+
+    def test_set_review_model_invalid_raises(self):
+        path = self._config('mode = "auto"\n')
+        with self.assertRaises(call_model.ConfigError):
+            review_plan.set_review_model(path, "totally-unknown-model-xyz")
+
+    def test_set_review_model_rejects_toml_injection(self):
+        path = self._config('mode = "auto"\nreview_model = "glm-5.2"\n')
+        original = Path(path).read_text(encoding="utf-8")
+        unsafe = 'opencode-go:glm-5.2"\nplan_review = "off'
+
+        with self.assertRaises(call_model.ConfigError):
+            review_plan.set_review_model(path, unsafe)
+
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), original)
+
+    def test_set_review_model_missing_config_raises(self):
+        with self.assertRaises(call_model.ConfigError):
+            review_plan.set_review_model(os.path.join(self.tmpdir, "nope.toml"), "glm-5.2")
+
+    def test_list_models_cli(self):
+        path = self._config('mode = "auto"\nreview_model = "glm-5.2"\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = review_plan.main(["--config", path, "--list-models"])
+        self.assertEqual(rc, 0)
+        self.assertIn("glm-5.2", stdout.getvalue())
+        self.assertIn("推荐", stdout.getvalue())
+        self.assertIn("当前", stdout.getvalue())
+
+    def test_list_models_cli_rejects_non_string_local_candidate(self):
+        path = self._config('[review_models]\nbroken = true\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = review_plan.main(["--config", path, "--list-models"])
+            except Exception as exc:
+                self.fail(f"CLI leaked an exception instead of a config error: {exc}")
+        self.assertEqual(rc, 3)
+        self.assertIn("review_models.broken", stderr.getvalue())
+
+    def test_list_models_cli_rejects_unknown_candidate_provider(self):
+        path = self._config(
+            '[review_models]\nprivate = "missing-provider:review-model"\n'
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = review_plan.main(["--config", path, "--list-models"])
+        self.assertEqual(rc, 3)
+        self.assertIn("missing-provider", stderr.getvalue())
+
+    def test_plan_mode_defaults_and_legacy(self):
+        self.assertEqual(review_plan.resolve_plan_mode({}), "ask")
+        self.assertEqual(review_plan.resolve_plan_mode({"plan_review": True}), "ask")
+        self.assertEqual(review_plan.resolve_plan_mode({"plan_review": False}), "off")
+        self.assertEqual(review_plan.resolve_plan_mode({"plan_review": "auto"}), "auto")
+        self.assertEqual(review_plan.resolve_plan_mode({"plan_review": "true"}), "ask")
+        self.assertEqual(review_plan.resolve_plan_mode({"plan_review": "false"}), "off")
+        with self.assertRaises(call_model.ConfigError):
+            review_plan.resolve_plan_mode({"plan_review": "bogus"})
+
+    def test_set_plan_mode_updates_and_preserves(self):
+        path = self._config(
+            '# comment\nmode = "manual"\nplan_review = true\n\n'
+            'review_model = "glm-5.2"\n'
+        )
+        review_plan.set_plan_mode(path, "auto")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("# comment", text)
+        self.assertIn('plan_review = "auto"', text)
+        self.assertIn('review_model = "glm-5.2"', text)
+        self.assertEqual(review_plan.resolve_plan_mode(call_model.load_config(path)), "auto")
+
+    def test_set_plan_mode_inserts_when_missing(self):
+        path = self._config('mode = "auto"\n')
+        review_plan.set_plan_mode(path, "off")
+        self.assertEqual(
+            review_plan.resolve_plan_mode(call_model.load_config(path)), "off"
+        )
+
+    def test_set_plan_mode_invalid_raises(self):
+        path = self._config('mode = "auto"\n')
+        with self.assertRaises(call_model.ConfigError):
+            review_plan.set_plan_mode(path, "bogus")
+
+    def test_plan_mode_cli(self):
+        path = self._config('mode = "auto"\nplan_review = "ask"\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = review_plan.main(["--config", path, "--plan-mode"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue().strip(), "ask")
+
+    def test_plan_mode_cli_rejects_malformed_providers(self):
+        path = self._config('providers = "not-a-table"\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = review_plan.main(["--config", path, "--plan-mode"])
+            except Exception as exc:
+                self.fail(f"CLI leaked an exception instead of a config error: {exc}")
+        self.assertEqual(rc, 3)
+        self.assertIn("providers", stderr.getvalue())
+
+    def test_set_plan_mode_cli(self):
+        path = self._config('mode = "auto"\nplan_review = "ask"\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = review_plan.main(["--config", path, "--set-plan-mode", "auto"])
+        self.assertEqual(rc, 0)
+        self.assertIn("plan_review = auto", stdout.getvalue())
+        self.assertEqual(
+            review_plan.resolve_plan_mode(call_model.load_config(path)), "auto"
+        )
+
+
+class TestPlanReviewHook(unittest.TestCase):
+    def test_ask_context(self):
+        text = plan_review_hook.build_context({"plan_review": "ask"}, "plan")
+        self.assertIn("plan_review=ask", text)
+        self.assertIn("--list-models", text)
+        self.assertIn("--review", text)
+        self.assertIn("实施计划", text)
+        self.assertIn("review 计划", text)
+        self.assertIn("同时展示", text)
+
+    def test_auto_context(self):
+        text = plan_review_hook.build_context({"plan_review": "auto"}, "plan")
+        self.assertIn("plan_review=auto", text)
+        self.assertIn("--review", text)
+
+    def test_off_and_non_plan_are_silent(self):
+        self.assertIsNone(plan_review_hook.build_context({"plan_review": "off"}, "plan"))
+        self.assertIsNone(plan_review_hook.build_context({"plan_review": "ask"}, "default"))
+        self.assertIsNone(plan_review_hook.build_context({}, "default"))
+
+    def test_simulate_cli_prints_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            config = os.path.join(d, "config.toml")
+            Path(config).write_text('plan_review = "ask"\n', encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = plan_review_hook.main(
+                    [
+                        "--simulate",
+                        "--permission-mode",
+                        "plan",
+                        "--config",
+                        config,
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("Plan Review Gate", stdout.getvalue())
+
+
+class TestInstallPlanHook(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.hooks = os.path.join(self.tmpdir, "hooks.json")
+
+    def test_install_idempotent_and_uninstall_preserves_others(self):
+        Path(self.hooks).write_text(
+            json.dumps(
+                {
+                    "description": "my hooks",
+                    "hooks": {
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": "echo hi"}]}
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        changed, _ = install_plan_hook.install(self.hooks)
+        self.assertTrue(changed)
+        changed_again, _ = install_plan_hook.install(self.hooks)
+        self.assertFalse(changed_again)
+
+        data = json.loads(Path(self.hooks).read_text(encoding="utf-8"))
+        self.assertEqual(data["description"], "my hooks")
+        self.assertIn("SessionStart", data["hooks"])
+        commands = [
+            item["command"]
+            for group in data["hooks"]["UserPromptSubmit"]
+            for item in group["hooks"]
+        ]
+        self.assertEqual(commands.count(install_plan_hook.hook_command()), 1)
+
+        changed_uninstall, _ = install_plan_hook.uninstall(self.hooks)
+        self.assertTrue(changed_uninstall)
+        data = json.loads(Path(self.hooks).read_text(encoding="utf-8"))
+        self.assertEqual(data["description"], "my hooks")
+        self.assertIn("SessionStart", data["hooks"])
+        self.assertNotIn("UserPromptSubmit", data["hooks"])
+
+        changed_uninstall_again, _ = install_plan_hook.uninstall(self.hooks)
+        self.assertFalse(changed_uninstall_again)
+
+    def test_status_when_missing(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = install_plan_hook.main(["--status", "--hooks-file", self.hooks])
+        self.assertEqual(rc, 0)
+        self.assertIn("未安装", stdout.getvalue())
 
 
 if __name__ == "__main__":
