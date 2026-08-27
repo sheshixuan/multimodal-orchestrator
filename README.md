@@ -62,8 +62,11 @@ git clone https://github.com/sheshixuan/multimodal-orchestrator ~/.codex/skills/
 2. 首次触发 skill 时会先询问**触发模式**（统一或按宿主选择 auto/manual），
    再按 vision / review / core 三模块引导配置 API，自动生成 `config.toml`；
    也可以参考仓库里的 `config.example.toml` 手工创建。
-3. 引导会运行 `scripts/call_model.py --check-key` 做健康检查（Go 订阅探测 / Zen 余额探测）。
-4. 想重跑引导：直接说"重新配置 multimodal-orchestrator"。
+3. 引导会询问是否安装 **Codex Plan 收尾评审门 hook**（默认是），运行
+   `scripts/install_plan_hook.py --install` 写入 `~/.codex/hooks.json`；
+   安装后先在 Codex 里运行 `/hooks` 信任该 hook，再重启 Codex 或新开任务生效。
+4. 引导会运行 `scripts/call_model.py --check-key` 做健康检查（Go 订阅探测 / Zen 余额探测）。
+5. 想重跑引导：直接说"重新配置 multimodal-orchestrator"。
 
 ## 使用示例
 
@@ -83,6 +86,55 @@ python3 <skill_dir>/scripts/call_model.py --check-key
 # 查看内置 provider 预设
 python3 <skill_dir>/scripts/call_model.py --list-presets
 ```
+
+## Codex Plan 收尾评审（Plan Review Gate）
+
+安装本 skill 并执行 `scripts/install_plan_hook.py --install` 后，会在
+`~/.codex/hooks.json` 注册一个 `UserPromptSubmit` hook：每次使用 Codex Plan 模式，
+在计划草稿完成、准备提交最终计划前，按 `plan_review` 配置进入评审门。
+首次信任 hook：在 Codex 里运行 `/hooks`，然后重启 Codex 或新开任务。
+
+```
+# 列出可用评审模型（含推荐项、当前配置与 API key 状态）
+python3 <skill_dir>/scripts/review_plan.py --list-models
+
+# 查看/切换 Plan 收尾评审时机：off / ask / auto
+python3 <skill_dir>/scripts/review_plan.py --plan-mode
+python3 <skill_dir>/scripts/review_plan.py --set-plan-mode ask
+
+# 保存用户选择的评审模型（可跨任务复用）
+python3 <skill_dir>/scripts/review_plan.py --set-model kimi-k3
+
+# 用当前配置的 review_model 评审已落盘的计划
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md
+
+# 本次临时指定评审模型并附原图交叉核验
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
+  --model opencode-zen:gemini-3.1-pro --image 原图.png
+```
+
+`plan_review` 三档：`ask`（默认，最后一步同时展示实施计划与 review 计划后让用户选模型，可跳过）、
+`auto`（不询问，直接用当前 `review_model` 自动评审）、`off`（关闭）。
+旧值 `true/false` 兼容为 `ask/off`。用户未选择模型前不会调用任何外部模型，
+因此 manual 模式同样适用。卸载 hook：`scripts/install_plan_hook.py --uninstall`。
+
+`ask` 的执行顺序：先完成实施计划并准备 review 计划，最后一步把实施计划和
+review 计划同时展示给用户，再询问用哪个模型评审或跳过。
+
+可在本地 `config.toml` 中同时保留多个 provider 的评审候选；内置候选不会被替换，
+重复模型会自动去重：
+
+```toml
+[review_models]
+opencode_go = "glm-5.2"
+private_proxy = "myproxy:review-model"
+
+[providers.myproxy]
+base_url = "https://your-proxy.example.com/v1"
+env = "MY_PROXY_API_KEY"
+```
+
+这里只保存模型、接口地址和环境变量名称。API key 本身仍只放环境变量。
 
 ## 模型配置
 

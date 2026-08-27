@@ -156,10 +156,21 @@ def load_config(path=None):
 
 def build_providers(cfg):
     providers = {name: dict(p) for name, p in PRESETS.items()}
-    for name, opts in cfg.get("providers", {}).items():
+    configured = cfg.get("providers", {})
+    if not isinstance(configured, dict):
+        raise ConfigError("providers 必须使用 [providers.<name>] 配置段")
+    for name, opts in configured.items():
+        if not isinstance(opts, dict):
+            raise ConfigError(f"providers.{name} 必须是配置段")
+        base_url = opts.get("base_url", "")
+        env = opts.get("env", "OPENCODE_API_KEY")
+        if not isinstance(base_url, str) or not base_url:
+            raise ConfigError(f"providers.{name}.base_url 必须是非空字符串")
+        if not isinstance(env, str) or not env:
+            raise ConfigError(f"providers.{name}.env 必须是非空字符串")
         providers[name] = {
-            "base_url": opts.get("base_url", ""),
-            "env": opts.get("env", "OPENCODE_API_KEY"),
+            "base_url": base_url,
+            "env": env,
             "note": "自定义 provider",
             "prefixes": [],
         }
@@ -170,11 +181,17 @@ def build_providers(cfg):
 
 def resolve_provider(model, providers, explicit=None):
     """返回 (provider_name, model)。支持 'provider:model'、显式 provider、前缀自动匹配。"""
+    if not model or any(not (ch.isalnum() or ch in "._:/-") for ch in model):
+        raise ConfigError(f"非法模型名: {model!r}")
     if ":" in model:
         provider_name, _, rest = model.partition(":")
         if provider_name and rest:
+            if provider_name not in providers:
+                raise ConfigError(f"未知 provider: {provider_name}")
             return provider_name, rest
     if explicit:
+        if explicit not in providers:
+            raise ConfigError(f"未知 provider: {explicit}")
         return explicit, model
     candidates = []
     for name, pres in providers.items():
@@ -414,7 +431,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
-    providers = build_providers(cfg)
+    try:
+        providers = build_providers(cfg)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
 
     if args.list_presets:
         print(f"{'provider':<14}{'base_url':<52}{'env':<22}自动匹配前缀")

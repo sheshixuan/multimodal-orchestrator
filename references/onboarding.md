@@ -29,10 +29,12 @@
    - Go 端点返回 `ModelError / 401` → 检查 key 是否对应有效订阅；Zen 端点返回
      `CreditsError / Insufficient balance` → 告知用户去 opencode billing 充值后重试，
      **中止写入配置**。
-5. **写配置**：把 mode 段与三行模型配置写入 `<skill_dir>/config.toml`（按用户选择替换模式与模型名）：
+5. **写配置**：把 mode 段、模型与 `plan_review` 写入 `<skill_dir>/config.toml`
+   （按用户选择替换模式与模型名）：
 
    ```toml
    mode = "auto"
+   plan_review = "ask"
 
    [hosts.workbudy]
    mode = "manual"
@@ -44,9 +46,20 @@
 
    如需显式指定 provider，模型名写成 `provider:model`（如 `opencode-zen:gemini-3.5-flash`）；
    如需自定义 provider，按 `references/model_presets.md` 增加 `[providers.xxx]`。
-6. **继续原任务**：回到分派流程（`scripts/route.py --host <当前宿主> [--explicit]` → 执行各模块）
+   `plan_review` 控制 Codex Plan 收尾评审门：`ask`（默认）表示每次 Plan 提交最终计划前
+   先完成实施计划并准备 review 计划，最后一步同时展示后让用户选评审模型并评审；
+   `auto` 表示不询问、直接用 `review_model` 自动评审；
+   `off` 表示关闭。旧值 `true/false` 兼容为 `ask/off`。
+6. **安装 Plan 收尾评审门 hook**（Codex 宿主建议，默认询问是否安装）：
+   运行 `python3 <skill_dir>/scripts/install_plan_hook.py --install` 写入
+   `~/.codex/hooks.json`；随后让用户在 Codex 里运行 `/hooks` 审查并信任该 hook，
+   重启 Codex 或新开任务后生效。已安装时再次运行是幂等 no-op；用
+   `--uninstall` 可移除。
+7. **继续原任务**：回到分派流程（`scripts/route.py --host <当前宿主> [--explicit]` → 执行各模块）
    处理用户最初的请求。
 
 > 之后想随时切换 auto/manual（含按宿主），无需重跑引导，直接运行
 > `python3 <skill_dir>/scripts/mode.py --set auto|manual [--host <宿主>]`；
 > `--unset-host <宿主>` 可移除某宿主的覆盖回退全局。
+> 想随时切换 Plan 收尾评审时机，运行
+> `python3 <skill_dir>/scripts/review_plan.py --set-plan-mode off|ask|auto`。

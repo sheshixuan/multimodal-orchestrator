@@ -35,6 +35,31 @@
 - 健康检查默认用 `deepseek-v4-flash` 探测订阅有效性（成本为 0，订阅制不限量）。
 - Zen 用户（按量）：vision 推荐 `gemini-3.5-flash`，review 推荐 `gemini-3.1-pro`。
 
+## Codex Plan 收尾评审候选（Plan Review Gate）
+
+`scripts/review_plan.py --list-models` 展示的评审候选（推荐项优先，可按实际可用性编辑脚本内
+`REVIEW_MODELS`）：
+
+| 模型 | provider | 说明 |
+|---|---|---|
+| `glm-5.2` | opencode-go | 推荐，评审稳健 |
+| `kimi-k3` | opencode-go | 备选 |
+| `deepseek-v4-pro` | opencode-go | 备选 |
+| `opencode-zen:gemini-3.1-pro` | opencode-zen | 备选，Zen 按量计费 |
+
+`config.toml` 可用 `[review_models]` 追加本地候选，并通过 `provider:model` 指向不同 provider；
+内置候选仍会保留，重复模型会自动去重：
+
+```toml
+[review_models]
+opencode_go = "glm-5.2"
+private_proxy = "myproxy:review-model"
+```
+
+触发时机由 `config.toml` 的顶层 `plan_review` 控制：`ask`（默认，Plan 收尾最后一步同时展示实施计划与 review 计划后选模型）、
+`auto`（直接用当前 `review_model` 自动评审）、`off`（关闭）；旧值 `true/false`
+兼容为 `ask/off`。hook 安装与卸载见 `scripts/install_plan_hook.py --help`。
+
 ## 自定义 provider
 
 在 `config.toml` 增加：
