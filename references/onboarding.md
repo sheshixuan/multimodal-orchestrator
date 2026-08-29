@@ -17,7 +17,8 @@
      不算点名。未提及时绝不调用外部模型、不消耗 API。
 2. **确认三模块模型**（逐一询问，附推荐项）：
    - vision：推荐从 OpenCode Go 模型列表选 `qwen3.8-max`（实测可识图）或 `mimo-v2.5`（备选，reasoning 型需给足 max_tokens）。
-   - review：推荐 `glm-5.2`（评审稳健）或 `kimi-k3` / `deepseek-v4-pro`。
+   - review：至少配置一个模型；用户有多个 provider 时，把所有允许参与自动路由的模型写入
+     `[review_models]`，不要用新 provider 替换或删除原有候选。
    - core：固定 `self`，无需询问（主代理自处理，读取 `~/.codex/config.toml` 主模型）。
 3. **确认 API key 来源**：默认使用环境变量 `OPENCODE_API_KEY`；用户也可改用
    `VISION_API_KEY`/`REVIEW_API_KEY`（模块级覆盖）或 `GEMINI_API_KEY` 等（provider 级）。
@@ -42,13 +43,26 @@
    vision_model = "qwen3.8-max"
    review_model = "glm-5.2"
    core = "self"
+
+   [review_models]
+   primary = "glm-5.2"
+
+   [review_routing]
+   mode = "auto"
+   slow_confirm_seconds = 180
+   max_calls = 3
+   max_total_output_tokens = 131072
+   max_wall_seconds = 1800
+   heartbeat_seconds = 30
+   long_plan_strategy = "adaptive_then_chunk"
+   conflict_judge = true
    ```
 
    如需显式指定 provider，模型名写成 `provider:model`（如 `opencode-zen:gemini-3.5-flash`）；
    如需自定义 provider，按 `references/model_presets.md` 增加 `[providers.xxx]`。
    `plan_review` 控制 Codex Plan 收尾评审门：`ask`（默认）表示每次 Plan 提交最终计划前
-   先完成实施计划并准备 review 计划，最后一步同时展示后让用户选评审模型并评审；
-   `auto` 表示不询问、直接用 `review_model` 自动评审；
+   先用 `--assess` 生成建议路由，让用户接受、覆盖或跳过；
+   `auto` 表示普通评审告知后自动开始，但慢任务、多模型、分片或扩容仍需确认；
    `off` 表示关闭。旧值 `true/false` 兼容为 `ask/off`。
 6. **安装 Plan 收尾评审门 hook**（Codex 宿主建议，默认询问是否安装）：
    运行 `python3 <skill_dir>/scripts/install_plan_hook.py --install` 写入

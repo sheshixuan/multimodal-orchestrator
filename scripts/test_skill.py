@@ -761,16 +761,20 @@ class TestPlanReviewHook(unittest.TestCase):
     def test_ask_context(self):
         text = plan_review_hook.build_context({"plan_review": "ask"}, "plan")
         self.assertIn("plan_review=ask", text)
-        self.assertIn("--list-models", text)
+        self.assertIn("--assess", text)
         self.assertIn("--review", text)
+        self.assertIn("--reviewer", text)
         self.assertIn("实施计划", text)
-        self.assertIn("review 计划", text)
-        self.assertIn("同时展示", text)
+        self.assertIn("建议路由", text)
+        self.assertIn("跳过", text)
 
     def test_auto_context(self):
         text = plan_review_hook.build_context({"plan_review": "auto"}, "plan")
         self.assertIn("plan_review=auto", text)
+        self.assertIn("--assess", text)
         self.assertIn("--review", text)
+        self.assertIn("--confirm-slow", text)
+        self.assertIn("退出码 4", text)
 
     def test_off_and_non_plan_are_silent(self):
         self.assertIsNone(plan_review_hook.build_context({"plan_review": "off"}, "plan"))

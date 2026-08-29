@@ -37,8 +37,8 @@
 
 ## Codex Plan 收尾评审候选（Plan Review Gate）
 
-`scripts/review_plan.py --list-models` 展示的评审候选（推荐项优先，可按实际可用性编辑脚本内
-`REVIEW_MODELS`）：
+`scripts/review_plan.py --list-models` 保留用于浏览兼容候选；自动路由的实际候选来自本地
+`review_model` 与 `[review_models]`，不会按下表模型名写路由分支：
 
 | 模型 | provider | 说明 |
 |---|---|---|
@@ -56,9 +56,9 @@ opencode_go = "glm-5.2"
 private_proxy = "myproxy:review-model"
 ```
 
-触发时机由 `config.toml` 的顶层 `plan_review` 控制：`ask`（默认，Plan 收尾最后一步同时展示实施计划与 review 计划后选模型）、
-`auto`（直接用当前 `review_model` 自动评审）、`off`（关闭）；旧值 `true/false`
-兼容为 `ask/off`。hook 安装与卸载见 `scripts/install_plan_hook.py --help`。
+触发时机由 `config.toml` 的顶层 `plan_review` 控制：`ask`（默认，展示计划与建议路由后接受、覆盖或跳过）、
+`auto`（普通评审告知后自动执行，慢任务仍确认）、`off`（关闭）；旧值 `true/false`
+兼容为 `ask/off`。能力覆盖、token 语义和预算配置见 `plan_review_routing.md`。
 
 ## 自定义 provider
 

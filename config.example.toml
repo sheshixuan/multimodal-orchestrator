@@ -29,6 +29,29 @@ core = "self"                  # 核心流程由主代理自处理
 opencode_go = "glm-5.2"
 # private_proxy = "myproxy:review-model"
 
+# Plan Review 自动路由默认已启用；以下均为默认值，可按需覆盖。
+[review_routing]
+mode = "auto"
+slow_confirm_seconds = 180
+max_calls = 3
+max_total_output_tokens = 131072
+max_wall_seconds = 1800
+heartbeat_seconds = 30
+long_plan_strategy = "adaptive_then_chunk"
+conflict_judge = true
+
+# 可选能力覆盖。段名必须对应 [review_models] 中的 alias；未配置字段会自动发现或低置信度推断。
+# [review_capabilities.opencode_go]
+# family = "reasoning-family"
+# modalities = ["text"]
+# quality = 90
+# reasoning_levels = ["high", "max"]
+# reasoning_field = "reasoning_effort"
+# context_limit = 1000000
+# output_limit = 384000
+# token_semantics = "combined" # answer_only / combined / separate / unknown
+# streaming = true
+
 # 自定义 provider 示例（API key 本身只放 MY_PROXY_API_KEY 环境变量）：
 # [providers.myproxy]
 # base_url = "https://your-proxy.example.com/v1"

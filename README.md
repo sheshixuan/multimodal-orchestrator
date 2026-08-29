@@ -8,7 +8,7 @@
 
 - **vision**：调用外部视觉模型（默认 OpenCode Go 上的 `qwen3.8-max`）把图片穷尽式转写为文本，充当主代理的"眼睛"。
 - **core**：主代理自己完成推理与产出（`core = self`，不产生额外 API 调用）。
-- **review**：调用外部模型（默认 `glm-5.2`）审查方案的正确性、完整性、可执行性与风险，可附原图交叉核验。
+- **review**：按方案难度、不确定性和风险自动选择一个或多个已配置 provider/model，匹配推理强度、token 预算与超时，输出结构化评审并在冲突时终局仲裁。
 - **分派**：`scripts/route.py` 按混合路由规则自动分类提示词（含图必走 vision、显式要求评审必走 review、其余仅 core），
   主代理结合实际上下文做最终判断。
 
@@ -77,8 +77,9 @@ python3 <skill_dir>/scripts/route.py --host codex --image /path/a.png --prompt "
 # vision：转写图片
 python3 <skill_dir>/scripts/call_model.py --role vision --image /path/a.png --prompt "转写这张图"
 
-# review：评审方案（可附原图交叉核验）
-python3 <skill_dir>/scripts/call_model.py --role review --plan 方案.md [--image /path/a.png]
+# review：先纯本地评估，再执行建议路由
+python3 <skill_dir>/scripts/review_plan.py --assess 方案.md --json
+python3 <skill_dir>/scripts/review_plan.py --review 方案.md [--image /path/a.png]
 
 # 健康检查
 python3 <skill_dir>/scripts/call_model.py --check-key
@@ -95,8 +96,8 @@ python3 <skill_dir>/scripts/call_model.py --list-presets
 首次信任 hook：在 Codex 里运行 `/hooks`，然后重启 Codex 或新开任务。
 
 ```
-# 列出可用评审模型（含推荐项、当前配置与 API key 状态）
-python3 <skill_dir>/scripts/review_plan.py --list-models
+# 纯本地评估：输出评分、建议模型、推理档位、预计耗时和资源上限
+python3 <skill_dir>/scripts/review_plan.py --assess 计划.md --json
 
 # 查看/切换 Plan 收尾评审时机：off / ask / auto
 python3 <skill_dir>/scripts/review_plan.py --plan-mode
@@ -105,21 +106,27 @@ python3 <skill_dir>/scripts/review_plan.py --set-plan-mode ask
 # 保存用户选择的评审模型（可跨任务复用）
 python3 <skill_dir>/scripts/review_plan.py --set-model kimi-k3
 
-# 用当前配置的 review_model 评审已落盘的计划
+# 使用自动路由评审；若退出码为 4，需先向用户确认慢任务
 python3 <skill_dir>/scripts/review_plan.py --review 计划.md
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md --confirm-slow
 
 # 本次临时指定评审模型并附原图交叉核验
 python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
   --model opencode-zen:gemini-3.1-pro --image 原图.png
+
+# 固定两个首轮评审者
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
+  --reviewer provider-a:model-a --reviewer provider-b:model-b --confirm-slow
 ```
 
-`plan_review` 三档：`ask`（默认，最后一步同时展示实施计划与 review 计划后让用户选模型，可跳过）、
-`auto`（不询问，直接用当前 `review_model` 自动评审）、`off`（关闭）。
-旧值 `true/false` 兼容为 `ask/off`。用户未选择模型前不会调用任何外部模型，
-因此 manual 模式同样适用。卸载 hook：`scripts/install_plan_hook.py --uninstall`。
+`plan_review` 三档：`ask`（默认，展示计划与建议路由后让用户接受、覆盖或跳过）、
+`auto`（普通评审告知后自动执行，慢任务仍确认）、`off`（关闭）。旧值 `true/false`
+兼容为 `ask/off`。`--assess` 不访问 API；多模型、预计超过 180 秒、分片或扩容必须加
+`--confirm-slow`。卸载 hook：`scripts/install_plan_hook.py --uninstall`。
 
-`ask` 的执行顺序：先完成实施计划并准备 review 计划，最后一步把实施计划和
-review 计划同时展示给用户，再询问用哪个模型评审或跳过。
+自动路由按能力字段工作，不在路由代码中硬编码具体模型/provider。`routine` 速度优先单模型，
+`complex` 质量优先单模型，`critical` 选择两个不同家族、优先不同 provider 的模型并行评审。
+冲突时最多再调用一个未参与首轮的模型；无可用第三模型时标记 `adjudicated_by=core`。
 
 可在本地 `config.toml` 中同时保留多个 provider 的评审候选；内置候选不会被替换，
 重复模型会自动去重：
@@ -129,12 +136,19 @@ review 计划同时展示给用户，再询问用哪个模型评审或跳过。
 opencode_go = "glm-5.2"
 private_proxy = "myproxy:review-model"
 
+[review_routing]
+max_calls = 3
+max_total_output_tokens = 131072
+max_wall_seconds = 1800
+slow_confirm_seconds = 180
+
 [providers.myproxy]
 base_url = "https://your-proxy.example.com/v1"
 env = "MY_PROXY_API_KEY"
 ```
 
-这里只保存模型、接口地址和环境变量名称。API key 本身仍只放环境变量。
+这里只保存模型、能力、接口地址和环境变量名称。API key 本身仍只放环境变量。完整配置、
+token 语义、失败分类和长方案分片见 `references/plan_review_routing.md`。
 
 ## 模型配置
 
@@ -148,11 +162,12 @@ env = "MY_PROXY_API_KEY"
 - API key 只从环境变量读取（默认 `OPENCODE_API_KEY`，可用 `VISION_API_KEY`/`REVIEW_API_KEY` 覆盖），
   **绝不写入 skill 文件或仓库**。
 - 仓库不包含任何密钥；`config.toml`（本地运行时配置）已在 `.gitignore` 中排除。
+- `.local/review-runtime.json` 只保存能力、耗时和 token 统计，不保存计划、回答、隐藏推理或鉴权头。
 
 ## 测试
 
 ```
-python3 scripts/test_skill.py        # 离线单测，无需 API key
+python3 -m unittest discover -s scripts -p 'test_*.py'  # 离线单测，无需 API key
 python3 scripts/call_model.py --list-presets   # 只读预设列表，无需 API key
 ```
 

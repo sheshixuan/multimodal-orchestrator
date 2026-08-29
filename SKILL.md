@@ -1,6 +1,6 @@
 ---
 name: multimodal-orchestrator
-description: 三模块流水线编排（vision 图像识别 → core 核心处理 → review 方案评审），让不同模块调用不同模型或 API。当主代理不具备视觉能力、需要转写图片/截图/图表、需要基于图片产出方案、或需要外部模型（如 OpenCode Go/Zen、Gemini）评审方案或交叉核验时使用。支持 auto（命中场景自动触发）与 manual（需提及式调用）两种触发模式，按宿主（Codex/WorkBuddy 等）分别配置；可为 Codex Plan 模式安装收尾评审门（plan_review=off/ask/auto）；首次使用会先选择模式再引导配置 API；用户说"重新配置 multimodal-orchestrator"时重跑引导。
+description: Use when 需要把图片或图表转写给无视觉主代理、让不同模块调用不同模型/API、用多个 provider 评审复杂方案、在 Codex Plan 收尾自动匹配推理强度与等待时间，或诊断 reasoning token 耗尽、超时和上下文限制。
 ---
 
 # Multimodal Orchestrator
@@ -47,8 +47,9 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 2. **vision（如需要）**：`python3 <skill_dir>/scripts/call_model.py --role vision --image <绝对路径> [--image ...] --prompt "转写需求"`，
    拿到文本转写后继续。模型取自 `config.toml` 的 `vision_model`。
 3. **core**：主代理基于转写/提示词自行推理产出方案；需要落盘时写入文件。
-4. **review（如需要）**：`python3 <skill_dir>/scripts/call_model.py --role review --plan <方案文件或-> [--image <原图>]`，
-   把评审意见并入最终回答（先结论、再问题、后修订建议）。模型取自 `config.toml` 的 `review_model`。
+4. **review（如需要）**：先运行 `python3 <skill_dir>/scripts/review_plan.py --assess <方案文件> --json`，
+   告知难度、建议模型、推理档位和预计耗时，再运行 `--review`。普通任务告知后执行；慢任务、多模型、
+   分片或扩容必须得到确认并加 `--confirm-slow`。评审细节见 `references/plan_review_routing.md`。
 
 ## Codex Plan 模式集成（Plan Review Gate）
 
@@ -58,26 +59,23 @@ description: 三模块流水线编排（vision 图像识别 → core 核心处�
 `python3 <skill_dir>/scripts/install_plan_hook.py --install`）。hook 只在
 Codex 的 Plan 权限模式下注入指令，不会在普通任务里打扰。
 
-1. **完成实施计划**：先把计划草稿落盘为文件（如 `<项目>/.codex/plan-review.md` 或
-   `work/plan-review.md`），不要在计划完成前先询问用户选择评审模型。
-2. **准备 review 计划**：运行 `python3 <skill_dir>/scripts/review_plan.py --list-models`，
-   整理一份简短 review 计划，说明本次评审重点、推荐/备选模型与 API key 状态；本步骤不调用外部模型。
-3. **最后一步同时展示**：把实施计划和 review 计划一起展示给用户，
-   询问"用哪个模型评审？也可以跳过"；用户也可以先审阅实施计划再决定。
-4. **持久化选择**：所选模型与 `config.toml` 不同时，运行
-   `python3 <skill_dir>/scripts/review_plan.py --set-model <模型>`。
-5. **评审计划**：运行 `python3 <skill_dir>/scripts/review_plan.py --review <计划文件> [--image <原图>] [--model <模型>]`。
-6. **修订并提交**：按输出约定把评审意见并入计划（先结论、再问题、后修订建议），修订后再提交最终计划。
+1. **完成实施计划**：先把草稿落盘，不要在内容完整前调用评审模型。
+2. **本地评估**：运行 `python3 <skill_dir>/scripts/review_plan.py --assess <计划文件> --json`。
+   本步骤不访问外部 API；把评分依据、建议 provider/模型、推理档位、预计区间、硬超时、最坏调用次数和能力置信度告知用户。
+3. **处理门控**：`plan_review=ask` 时让用户接受自动路由、用 `--model`/可重复的 `--reviewer` 覆盖，或跳过；
+   `auto` 时普通评审在告知后开始。`--review` 返回退出码 4 时停止，只有用户确认后才加 `--confirm-slow` 重跑。
+4. **评审与修订**：运行 `--review`；把统一 JSON 中的结论、问题、证据和建议并入计划。关键任务首轮并行占两个调用名额；第三次优先给按路由排序的失败评审者做一次已确认扩容，仅在无需重试且意见实质冲突时才调用未参与首轮的最强合格模型仲裁。无可用第三次调用时标记 `adjudicated_by=core`。
 
 控制与边界：
 - 顶层 `plan_review` 支持三档（缺失视为 `ask`；旧值 `true/false` 分别兼容为 `ask/off`）：
-  - `ask`（默认）：先完成实施计划并准备 review 计划，最后一步同时展示后等待用户选择，用户也可跳过。
-  - `auto`：不询问模型，直接用当前 `review_model` 自动评审并修订后提交。
+  - `ask`（默认）：展示实施计划和建议路由后等待用户接受、覆盖或跳过。
+  - `auto`：普通评审告知后自动开始；超过三分钟、多模型、分片或扩容仍需确认。
   - `off`：完全关闭本门，hook 不注入任何指令。
 - 随时切换（无需重跑引导）：`python3 <skill_dir>/scripts/review_plan.py --set-plan-mode off|ask|auto`；
   查看当前值用 `--plan-mode`。
-- 本门与 auto/manual 无关：向用户询问模型选择是发起 review 的显式步骤；用户未选择模型前
-  不调用任何外部模型，因此 manual 模式同样适用。
+- 本门与 auto/manual 无关，hook 触发也不构成慢调用授权。`--assess` 始终是纯本地操作；用户跳过或尚未确认多模型、慢任务、分片或重试时禁止模型调用。
+- 自动路由不会按具体模型名写分支；它只使用用户配置、provider 元数据、可信目录、本地缓存和低置信度名称推断。
+- 每次任务默认最多 3 次模型调用、累计 128K 输出 token、30 分钟；隐藏推理内容不进入输出或缓存。
 - 安装 hook 后需在 Codex 里运行 `/hooks` 审查并信任该 hook；信任后重启 Codex 或开新任务生效
   （当前已打开的会话不会重新加载 hook）。
 - `~/.codex/AGENTS.md` 保留一份相同规则作为未安装 hook 时的回退；已安装 hook 时以 hook 注入为准。
@@ -106,10 +104,12 @@ Codex 的 Plan 权限模式下注入指令，不会在普通任务里打扰。
   旧值 `true/false` 兼容为 `ask/off`）。
 - 模型名可写 `provider:model`（如 `opencode-zen:gemini-3.5-flash`）；支持 `[providers.<name>]` 自定义 base_url/env，
   详见 `references/model_presets.md`。
+- `[review_models]` 可配置多个候选；`[review_capabilities.<alias>]` 可覆盖模型家族、质量、推理档位、
+  context/output 上限、token 语义和流式能力；`[review_routing]` 控制确认阈值与资源上限。
 - API key 只从环境变量读取：默认 `OPENCODE_API_KEY`；vision/review 可分别用 `VISION_API_KEY`/`REVIEW_API_KEY`
   覆盖；兼容 `GEMINI_API_KEY`、`DASHSCOPE_API_KEY` 等 provider 级变量。
 - 其他参考：`references/agent_registry.md`（分派表与角色）、`references/vision_subagent_prompt.md`（vision 系统提示词）、
-  `references/onboarding.md`（引导脚本）。
+  `references/onboarding.md`（引导脚本）、`references/plan_review_routing.md`（智能路由、预算、失败分类和 CLI）。
 
 ## 输出约定
 

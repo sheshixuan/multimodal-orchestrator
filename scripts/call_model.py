@@ -18,15 +18,21 @@
 
 退出码：0=成功 1=API/网络错误 2=缺少 API key 3=配置/参数错误
 """
+from __future__ import annotations
+
 import argparse
+import ast
 import base64
 import io
 import json
 import mimetypes
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -115,10 +121,68 @@ class ConfigError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ModelCallResult:
+    text: str
+    status: str
+    finish_reason: str | None
+    completion_tokens: int
+    reasoning_tokens: int
+    saw_reasoning: bool
+    first_reasoning_seconds: float | None = None
+    first_content_seconds: float | None = None
+    elapsed_seconds: float = 0.0
+
+    def to_dict(self):
+        return asdict(self)
+
+
 # ---------- 配置 ----------
 
+def _strip_toml_comment(value):
+    quote = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if char in "\"'":
+            quote = None if quote == char else (char if quote is None else quote)
+        elif char == "#" and quote is None:
+            return value[:index].rstrip()
+    return value.strip()
+
+
+def _parse_toml_value(value):
+    value = _strip_toml_comment(value)
+    if not value:
+        return ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return value[1:-1]
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if re.fullmatch(r"[+-]?\d+", value):
+        return int(value)
+    if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", value):
+        return float(value)
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return value
+    return value
+
+
 def parse_toml_simple(text):
-    """解析本 skill 使用的极简 TOML 子集：注释、[section]、key = "value"。"""
+    """解析本 skill 使用的 TOML 子集，支持嵌套段、标量与简单列表。"""
     cfg = {}
     section = None
     for raw in text.splitlines():
@@ -132,13 +196,7 @@ def parse_toml_simple(text):
             continue
         key, _, val = line.partition("=")
         key = key.strip()
-        val = val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-            val = val[1:-1]
-        elif val == "true":
-            val = True
-        elif val == "false":
-            val = False
+        val = _parse_toml_value(val.strip())
         node = cfg
         if section:
             for part in section.split("."):
@@ -241,10 +299,39 @@ def build_messages(system_text, prompt_text, image_paths):
     return [{"role": "system", "content": system_text}, user]
 
 
-def build_payload(model, messages, temperature, max_tokens):
+def budget_fields(token_semantics, budget):
+    if not budget:
+        return {}
+    if token_semantics == "answer_only":
+        return {"max_tokens": budget}
+    if token_semantics == "separate":
+        return {"max_tokens": max(1, budget // 3), "max_completion_tokens": budget}
+    return {"max_completion_tokens": budget}
+
+
+def build_payload(
+    model,
+    messages,
+    temperature,
+    max_tokens,
+    *,
+    max_completion_tokens=None,
+    reasoning_effort=None,
+    reasoning_field="reasoning_effort",
+    stream=False,
+):
     payload = {"model": model, "messages": messages, "temperature": temperature}
     if max_tokens:
         payload["max_tokens"] = max_tokens
+    if max_completion_tokens:
+        payload["max_completion_tokens"] = max_completion_tokens
+    if reasoning_effort:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", reasoning_field or ""):
+            raise ConfigError(f"非法 reasoning_field：{reasoning_field!r}")
+        payload[reasoning_field] = reasoning_effort
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
     return payload
 
 
@@ -299,6 +386,152 @@ def extract_text(body):
     return content or ""
 
 
+def _reasoning_present(value):
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value)
+    return value is not None
+
+
+def _usage_counts(usage):
+    usage = usage if isinstance(usage, dict) else {}
+    completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    details = usage.get("completion_tokens_details", usage.get("output_tokens_details", {}))
+    details = details if isinstance(details, dict) else {}
+    reasoning = details.get("reasoning_tokens", usage.get("reasoning_tokens", 0))
+    return int(completion or 0), int(reasoning or 0)
+
+
+def _result_status(text, finish_reason, saw_reasoning, completion_tokens, requested_budget):
+    if finish_reason == "length":
+        if text:
+            return "incomplete_review"
+        near_budget = not requested_budget or completion_tokens >= int(requested_budget * 0.9)
+        if saw_reasoning and near_budget:
+            return "reasoning_budget_exhausted"
+        return "output_budget_exhausted"
+    return "success" if text else "empty_response"
+
+
+def normalize_response(body, *, requested_budget=None, elapsed_seconds=0.0):
+    choice = body.get("choices", [{}])[0] if isinstance(body, dict) else {}
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    text = extract_text(body) if isinstance(body, dict) else ""
+    reasoning = None
+    if isinstance(message, dict):
+        reasoning = next(
+            (message.get(name) for name in ("reasoning_content", "reasoning", "thinking") if message.get(name) is not None),
+            None,
+        )
+    completion, reasoning_tokens = _usage_counts(body.get("usage", {}) if isinstance(body, dict) else {})
+    saw_reasoning = _reasoning_present(reasoning) or reasoning_tokens > 0
+    finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+    return ModelCallResult(
+        text=text,
+        status=_result_status(text, finish, saw_reasoning, completion, requested_budget),
+        finish_reason=finish,
+        completion_tokens=completion,
+        reasoning_tokens=reasoning_tokens,
+        saw_reasoning=saw_reasoning,
+        elapsed_seconds=round(float(elapsed_seconds), 3),
+    )
+
+
+def classify_api_error(status_code, body):
+    lowered = (body or "").lower()
+    context_markers = (
+        "maximum context length", "context length exceeded", "context_length_exceeded",
+        "too many input tokens", "prompt is too long", "input tokens exceed",
+    )
+    if status_code in (400, 413, 422) and any(marker in lowered for marker in context_markers):
+        return "input_context_overflow"
+    return "api_error"
+
+
+def _delta_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            item.get("text", "") for item in value if isinstance(item, dict)
+        )
+    return ""
+
+
+def parse_stream_response(
+    lines,
+    *,
+    requested_budget=None,
+    started_at=None,
+    clock=time.monotonic,
+    heartbeat=None,
+    heartbeat_seconds=30,
+):
+    started = clock() if started_at is None else float(started_at)
+    last_heartbeat = started
+    first_reasoning = None
+    first_content = None
+    saw_reasoning = False
+    content_parts = []
+    finish_reason = None
+    usage = {}
+    for raw_line in lines:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace").strip()
+        else:
+            line = str(raw_line).strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        now = clock()
+        choices = event.get("choices", []) if isinstance(event, dict) else []
+        if choices:
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            delta = choice.get("delta", {}) if isinstance(choice.get("delta", {}), dict) else {}
+            reasoning = next(
+                (delta.get(name) for name in ("reasoning_content", "reasoning", "thinking") if delta.get(name) is not None),
+                None,
+            )
+            if _reasoning_present(reasoning):
+                saw_reasoning = True
+                if first_reasoning is None:
+                    first_reasoning = now - started
+            content = _delta_text(delta.get("content"))
+            if content:
+                content_parts.append(content)
+                if first_content is None:
+                    first_content = now - started
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+        if isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        if heartbeat and now - last_heartbeat >= heartbeat_seconds:
+            heartbeat(now - started, bool(content_parts))
+            last_heartbeat = now
+    ended = clock()
+    completion, reasoning_tokens = _usage_counts(usage)
+    saw_reasoning = saw_reasoning or reasoning_tokens > 0
+    text = "".join(content_parts)
+    return ModelCallResult(
+        text=text,
+        status=_result_status(text, finish_reason, saw_reasoning, completion, requested_budget),
+        finish_reason=finish_reason,
+        completion_tokens=completion,
+        reasoning_tokens=reasoning_tokens,
+        saw_reasoning=saw_reasoning,
+        first_reasoning_seconds=None if first_reasoning is None else round(first_reasoning, 3),
+        first_content_seconds=None if first_content is None else round(first_content, 3),
+        elapsed_seconds=round(ended - started, 3),
+    )
+
+
 # ---------- HTTP ----------
 
 def api_post(url, headers, payload, timeout):
@@ -311,6 +544,82 @@ def api_post(url, headers, payload, timeout):
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def call_chat(
+    *,
+    base_url,
+    api_key,
+    model,
+    messages,
+    timeout,
+    output_budget=None,
+    token_semantics="unknown",
+    reasoning_effort=None,
+    reasoning_field="reasoning_effort",
+    temperature=0.3,
+    stream=True,
+    heartbeat=None,
+    heartbeat_seconds=30,
+):
+    """执行一次规范化 chat/completions 调用，不返回原始隐藏推理。"""
+    fields = budget_fields(token_semantics, output_budget)
+    payload = build_payload(
+        model,
+        messages,
+        temperature,
+        fields.get("max_tokens"),
+        max_completion_tokens=fields.get("max_completion_tokens"),
+        reasoning_effort=reasoning_effort,
+        reasoning_field=reasoning_field,
+        stream=stream,
+    )
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    if not stream:
+        started = time.monotonic()
+        body = post_payload(url, headers, payload, timeout)
+        return normalize_response(
+            body,
+            requested_budget=output_budget,
+            elapsed_seconds=time.monotonic() - started,
+        )
+    def open_stream(stream_payload):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(stream_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    started = time.monotonic()
+    try:
+        response_context = open_stream(payload)
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if "temperature" in raw and payload.get("temperature") not in (None, 1):
+            response_context = open_stream(dict(payload, temperature=1))
+        else:
+            raise urllib.error.HTTPError(
+                exc.url, exc.code, exc.msg, exc.hdrs, io.BytesIO(raw.encode("utf-8"))
+            )
+    with response_context as response:
+        return parse_stream_response(
+            response,
+            requested_budget=output_budget,
+            started_at=started,
+            heartbeat=heartbeat,
+            heartbeat_seconds=heartbeat_seconds,
+        )
 
 
 def api_get(url, headers, timeout):
@@ -422,13 +731,29 @@ def main(argv=None):
     parser.add_argument("--system", help="系统提示词：字面文本、'@文件' 或 '-'")
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--max-completion-tokens", type=int, default=None)
+    parser.add_argument(
+        "--token-semantics",
+        choices=["answer_only", "combined", "separate", "unknown"],
+        help="输出预算语义；未指定时按所用预算字段保守推断",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    )
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument("--stream", dest="stream", action="store_true")
+    stream_group.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.set_defaults(stream=None)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--provider", help="显式指定 provider（--check-key 用）")
-    parser.add_argument("--json", action="store_true", help="输出原始 JSON 响应")
+    parser.add_argument("--json", action="store_true", help="输出不含隐藏推理的规范化 JSON")
     parser.add_argument("--check-key", action="store_true", help="只做健康检查（鉴权+余额探测）")
     parser.add_argument("--list-presets", action="store_true", help="列出内置 provider 预设")
     args = parser.parse_args(argv)
+    if args.max_tokens and args.max_completion_tokens:
+        parser.error("--max-tokens 与 --max-completion-tokens 不能同时指定")
 
     cfg = load_config(args.config)
     try:
@@ -485,14 +810,53 @@ def main(argv=None):
             return 3
 
     messages = build_messages(system_text, prompt_text, args.image)
-    payload = build_payload(model, messages, args.temperature, args.max_tokens)
     pres = providers[provider]
-    url = f"{pres['base_url']}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if args.max_completion_tokens:
+        output_budget = args.max_completion_tokens
+        token_semantics = args.token_semantics or "combined"
+    elif args.max_tokens:
+        output_budget = args.max_tokens
+        token_semantics = args.token_semantics or "answer_only"
+    elif role == "review":
+        output_budget = 8192
+        token_semantics = args.token_semantics or "combined"
+    else:
+        output_budget = None
+        token_semantics = args.token_semantics or "unknown"
+    use_stream = role == "review" if args.stream is None else args.stream
+
+    def heartbeat(elapsed, has_content):
+        stage = "正文生成中" if has_content else "推理中"
+        print(f"评审仍在运行：{int(elapsed)} 秒（{stage}）", file=sys.stderr, flush=True)
+
     try:
-        body = post_payload(url, headers, payload, args.timeout)
+        result = call_chat(
+            base_url=pres["base_url"],
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            timeout=args.timeout,
+            output_budget=output_budget,
+            token_semantics=token_semantics,
+            reasoning_effort=args.reasoning_effort,
+            temperature=args.temperature,
+            stream=use_stream,
+            heartbeat=heartbeat if use_stream else None,
+        )
     except urllib.error.HTTPError as exc:
-        print(format_http_error(exc), file=sys.stderr)
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        category = classify_api_error(getattr(exc, "code", 0), raw)
+        if category == "input_context_overflow":
+            print(f"input_context_overflow: {raw[:500]}", file=sys.stderr)
+        else:
+            rebuilt = urllib.error.HTTPError(
+                exc.url, exc.code, exc.msg, exc.hdrs, io.BytesIO(raw.encode("utf-8"))
+            )
+            print(format_http_error(rebuilt), file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(f"网络错误: {exc.reason}", file=sys.stderr)
@@ -502,15 +866,18 @@ def main(argv=None):
         return 1
 
     if args.json:
-        print(json.dumps(body, ensure_ascii=False))
+        print(json.dumps(result.to_dict(), ensure_ascii=False))
+    elif result.status == "success":
+        print(result.text)
     else:
-        text = extract_text(body)
-        if not text:
-            finish = body.get("choices", [{}])[0].get("finish_reason")
-            hint = "（finish_reason=length：reasoning 模型吃满 token，请加大 --max-tokens）" if finish == "length" else ""
-            print(f"响应中无文本内容{hint}: {json.dumps(body, ensure_ascii=False)[:300]}", file=sys.stderr)
-            return 1
-        print(text)
+        hints = {
+            "reasoning_budget_exhausted": "推理已耗尽组合输出预算，未生成正文；这不是输入上下文溢出",
+            "incomplete_review": "正文未完整生成，结果不能作为最终评审",
+            "output_budget_exhausted": "输出预算已耗尽",
+            "empty_response": "响应中无文本内容",
+        }
+        print(f"{result.status}: {hints.get(result.status, '评审调用失败')}", file=sys.stderr)
+        return 1
     return 0
 
 
