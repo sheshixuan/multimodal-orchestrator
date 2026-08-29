@@ -22,6 +22,7 @@ DIMENSION_LEVEL = {"pass": 0, "warn": 1, "block": 2}
 VERDICT_LEVEL = {"pass": 0, "revise": 1, "block": 2}
 SEVERITY_LEVEL = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 HARD_MAX_CALLS = 3
+MIN_STRUCTURED_OUTPUT_TOKENS = 1024
 
 STRUCTURED_REVIEW_SYSTEM = """你是方案评审器。只输出一个 JSON 对象，不要 Markdown 围栏，也不要展示推理过程。
 JSON 必须包含：
@@ -212,7 +213,10 @@ def chunk_plan(plan: str, max_chars: int = 12000) -> list[str]:
         if body.strip() not in constraint_bodies and body.strip() not in constraints:
             variable.append(body)
     if not variable:
-        variable = [plan]
+        chunk = f"{constraints}\n\n## 当前评审分片 1/1\n（本方案全部属于不可变全局约束）"
+        if len(chunk) > max_chars:
+            raise ValueError("global_constraints_exceed_chunk_limit")
+        return [chunk]
     pieces = []
     for body in variable:
         pieces.extend(_split_text(body, target))
@@ -253,6 +257,17 @@ def _review_prompt(plan: str) -> str:
     return "请按固定 JSON schema 评审以下实施计划。证据必须引用计划中的具体约束：\n\n" + plan
 
 
+def _observed_combined_exhaustion(response, budget):
+    threshold = int(budget * 0.9)
+    if response.status == "reasoning_budget_exhausted":
+        return response.saw_reasoning and max(
+            response.completion_tokens, response.reasoning_tokens
+        ) >= threshold
+    if response.status == "incomplete_review":
+        return response.completion_tokens >= threshold
+    return False
+
+
 def _judge_prompt(plan: str, reviews: list[dict[str, Any]]) -> str:
     return (
         "你是终局仲裁者。以下两个评审存在实质冲突。根据原计划和证据给出一次终局评审；"
@@ -285,7 +300,7 @@ def execute_review(
     started_at = time.monotonic()
     effective_max_calls = min(max(1, route.max_calls), HARD_MAX_CALLS)
 
-    def invoke(item, selected, prompt):
+    def invoke(item, selected, prompt, *, minimum_budget_exclusive=None):
         nonlocal call_count, requested_tokens, actual_tokens
         with lock:
             if call_count >= effective_max_calls:
@@ -299,6 +314,8 @@ def execute_review(
             budget = min(selected.output_budget, remaining, item.output_limit)
             if budget <= 0:
                 return None
+            if minimum_budget_exclusive is not None and budget <= minimum_budget_exclusive:
+                return None
             selected = replace(
                 selected,
                 output_budget=budget,
@@ -311,12 +328,9 @@ def execute_review(
             response = replace(response, text="", status="wall_time_exceeded")
         with lock:
             actual_tokens += max(0, response.completion_tokens)
-            observed_semantics = (
-                "combined"
-                if response.status == "reasoning_budget_exhausted"
-                and response.reasoning_tokens >= int(budget * 0.9)
-                else None
-            )
+            observed_semantics = "combined" if _observed_combined_exhaustion(
+                response, budget
+            ) else None
             call_records.append(
                 {
                     "alias": item.alias,
@@ -418,16 +432,7 @@ def execute_review(
         item = profiles_by_alias[alias]
         semantics_confirmed_by_response = bool(
             response is not None
-            and (
-                (
-                    response.status == "reasoning_budget_exhausted"
-                    and response.reasoning_tokens >= int(selected.output_budget * 0.9)
-                )
-                or (
-                    response.status == "incomplete_review"
-                    and response.completion_tokens >= int(selected.output_budget * 0.9)
-                )
-            )
+            and _observed_combined_exhaustion(response, selected.output_budget)
         )
         semantics_confirmed_by_metadata = bool(
             item.source != "name_heuristic" and item.token_semantics != "unknown"
@@ -442,7 +447,12 @@ def execute_review(
             expanded_budget = min(item.output_limit, selected.output_budget * 2)
             if expanded_budget > selected.output_budget:
                 expanded = replace(selected, output_budget=expanded_budget)
-                retried = invoke(item, expanded, prompt)
+                retried = invoke(
+                    item,
+                    expanded,
+                    prompt,
+                    minimum_budget_exclusive=selected.output_budget,
+                )
                 if retried is not None:
                     response = retried
         if response is not None:
@@ -495,6 +505,16 @@ def execute_review(
     if not parsed and (retry_exhausted or runtime_overflow) and call_count < effective_max_calls and route.reviewers:
         selected = route.reviewers[0]
         item = profiles_by_alias[selected.alias]
+        if route.max_total_output_tokens - requested_tokens < MIN_STRUCTURED_OUTPUT_TOKENS:
+            return {
+                "status": "resource_limit",
+                "reason": "insufficient_output_tokens_for_adaptive_chunk",
+                "call_count": call_count,
+                "requested_output_tokens": requested_tokens,
+                "completion_tokens": actual_tokens,
+                "calls": call_records,
+                "invalid_reviews": invalid,
+            }
         try:
             chunks = _chunks_for_profile(plan, item, selected)
         except ValueError as exc:

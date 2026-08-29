@@ -172,6 +172,18 @@ POST /v2/items。
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 1000 for chunk in chunks))
 
+    def test_all_constraint_plan_is_not_duplicated_into_fake_chunks(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        plan = "# 目标\n" + "稳定上线。" * 180 + "\n# 验收标准\n" + "必须通过。" * 180
+
+        chunks = self.engine.chunk_plan(plan, max_chars=4000)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].count("# 目标"), 1)
+        self.assertEqual(chunks[0].count("# 验收标准"), 1)
+
 
 class TestReviewExecution(unittest.TestCase):
     @classmethod
@@ -308,6 +320,59 @@ class TestReviewExecution(unittest.TestCase):
 
         self.assertEqual(calls, [32000, 64000])
         self.assertEqual(output["status"], "success")
+
+    def test_completion_total_confirms_reasoning_exhaustion_without_reasoning_detail(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        inferred = replace(
+            profile("inferred", "provider-a", "family-a", source="name_heuristic"),
+            token_semantics="unknown",
+        )
+        budgets = []
+
+        def caller(item, selected, prompt, system):
+            budgets.append(selected.output_budget)
+            if len(budgets) == 1:
+                return call_model.ModelCallResult(
+                    text="",
+                    status="reasoning_budget_exhausted",
+                    finish_reason="length",
+                    completion_tokens=selected.output_budget,
+                    reasoning_tokens=0,
+                    saw_reasoning=True,
+                )
+            return result(structured_review("pass"))
+
+        output = self.engine.execute_review(
+            "plan", route([inferred], tier="complex"), [inferred], caller, confirmed=True
+        )
+
+        self.assertEqual(budgets, [32000, 64000])
+        self.assertEqual(output["calls"][0]["observed_token_semantics"], "combined")
+        self.assertEqual(output["status"], "success")
+
+    def test_retry_is_not_called_when_total_token_remainder_cannot_increase_budget(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        primary = profile("primary", "provider-a", "family-a")
+        constrained_route = replace(
+            route([primary], tier="complex"),
+            max_total_output_tokens=32001,
+        )
+        budgets = []
+
+        def caller(item, selected, prompt, system):
+            budgets.append(selected.output_budget)
+            return result(status="incomplete_review", tokens=selected.output_budget)
+
+        output = self.engine.execute_review(
+            "plan", constrained_route, [primary], caller, confirmed=True
+        )
+
+        self.assertEqual(budgets, [32000])
+        self.assertEqual(output["status"], "resource_limit")
 
     def test_observed_incomplete_output_confirms_low_confidence_semantics(self):
         self.assertIsNotNone(self.engine, "review_engine module is required")
