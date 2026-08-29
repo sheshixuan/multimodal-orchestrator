@@ -79,6 +79,24 @@ class TestResultClassification(unittest.TestCase):
         self.assertTrue(result.saw_reasoning)
         self.assertNotIn("hidden reasoning", json.dumps(asdict(result)))
 
+    def test_reasoning_detail_tokens_can_confirm_exhaustion_when_total_is_missing(self):
+        body = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": "", "reasoning_content": "hidden reasoning"},
+                }
+            ],
+            "usage": {
+                "completion_tokens": 0,
+                "completion_tokens_details": {"reasoning_tokens": 3000},
+            },
+        }
+
+        result = call_model.normalize_response(body, requested_budget=3000)
+
+        self.assertEqual(result.status, "reasoning_budget_exhausted")
+
     def test_partial_content_at_length_is_incomplete_review(self):
         self.assertTrue(hasattr(call_model, "normalize_response"))
         body = {
@@ -177,6 +195,42 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual(payload["max_completion_tokens"], 8192)
         self.assertNotIn("max_tokens", payload)
         self.assertEqual(payload["reasoning_effort"], "high")
+
+    def test_call_chat_forwards_configured_heartbeat_interval(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        expected = call_model.ModelCallResult(
+            text="done",
+            status="success",
+            finish_reason="stop",
+            completion_tokens=1,
+            reasoning_tokens=0,
+            saw_reasoning=False,
+        )
+        with unittest.mock.patch(
+            "call_model.urllib.request.urlopen", return_value=Response()
+        ):
+            with unittest.mock.patch(
+                "call_model.parse_stream_response", return_value=expected
+            ) as parser:
+                call_model.call_chat(
+                    base_url="https://provider.example/v1",
+                    api_key="x",
+                    model="reasoner",
+                    messages=[{"role": "user", "content": "review"}],
+                    timeout=30,
+                    output_budget=8192,
+                    stream=True,
+                    heartbeat=lambda *_: None,
+                    heartbeat_seconds=7,
+                )
+
+        self.assertEqual(parser.call_args.kwargs["heartbeat_seconds"], 7)
 
 
 class TestCallModelCli(unittest.TestCase):

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any, Callable
@@ -20,6 +21,7 @@ DIMENSIONS = (
 DIMENSION_LEVEL = {"pass": 0, "warn": 1, "block": 2}
 VERDICT_LEVEL = {"pass": 0, "revise": 1, "block": 2}
 SEVERITY_LEVEL = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+HARD_MAX_CALLS = 3
 
 STRUCTURED_REVIEW_SYSTEM = """你是方案评审器。只输出一个 JSON 对象，不要 Markdown 围栏，也不要展示推理过程。
 JSON 必须包含：
@@ -173,8 +175,35 @@ def extract_global_constraints(plan: str) -> str:
     return "## 不可变全局约束\n" + "\n\n".join(item for item in selected if item)
 
 
+def _split_text(text: str, limit: int) -> list[str]:
+    if limit <= 0:
+        raise ValueError("chunk_limit_too_small")
+    remaining = text.strip()
+    parts = []
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        minimum = max(1, limit // 2)
+        positions = []
+        for marker in ("\n\n", "\n", "。", "！", "？", ". "):
+            position = window.rfind(marker, minimum)
+            if position >= minimum:
+                positions.append(position + len(marker))
+        cut = max(positions, default=0)
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
 def chunk_plan(plan: str, max_chars: int = 12000) -> list[str]:
     constraints = extract_global_constraints(plan)
+    label_reserve = 64
+    target = max_chars - len(constraints) - label_reserve
+    if target <= 0:
+        raise ValueError("global_constraints_exceed_chunk_limit")
     constraint_bodies = set()
     for _, body in _sections(constraints):
         constraint_bodies.add(body.strip())
@@ -184,11 +213,13 @@ def chunk_plan(plan: str, max_chars: int = 12000) -> list[str]:
             variable.append(body)
     if not variable:
         variable = [plan]
+    pieces = []
+    for body in variable:
+        pieces.extend(_split_text(body, target))
     groups = []
     current = []
     current_size = 0
-    target = max(1, max_chars - len(constraints) - 32)
-    for body in variable:
+    for body in pieces:
         if current and current_size + len(body) + 2 > target:
             groups.append("\n\n".join(current))
             current, current_size = [], 0
@@ -196,7 +227,26 @@ def chunk_plan(plan: str, max_chars: int = 12000) -> list[str]:
         current_size += len(body) + 2
     if current:
         groups.append("\n\n".join(current))
-    return [f"{constraints}\n\n## 当前评审分片 {index}/{len(groups)}\n{body}" for index, body in enumerate(groups, 1)]
+    chunks = [
+        f"{constraints}\n\n## 当前评审分片 {index}/{len(groups)}\n{body}"
+        for index, body in enumerate(groups, 1)
+    ]
+    if any(len(chunk) > max_chars for chunk in chunks):
+        raise ValueError("chunk_exceeds_hard_character_limit")
+    return chunks
+
+
+def _chunks_for_profile(plan, item, selected):
+    safe_input_tokens = int(item.context_limit * 0.85) - selected.output_budget
+    if safe_input_tokens <= 0:
+        raise ValueError("output_reservation_exceeds_context_safe_line")
+    max_chars = int(max(0, safe_input_tokens / 1.2 - 768) / 1.2)
+    if max_chars <= 0:
+        raise ValueError("global_protocol_overhead_exceeds_context_safe_line")
+    chunks = chunk_plan(plan, max_chars=max_chars)
+    if any(review_router.estimate_tokens(chunk) > safe_input_tokens for chunk in chunks):
+        raise ValueError("chunk_token_estimate_exceeds_context_safe_line")
+    return chunks
 
 
 def _review_prompt(plan: str) -> str:
@@ -232,11 +282,16 @@ def execute_review(
     requested_tokens = 0
     actual_tokens = 0
     call_records = []
+    started_at = time.monotonic()
+    effective_max_calls = min(max(1, route.max_calls), HARD_MAX_CALLS)
 
     def invoke(item, selected, prompt):
         nonlocal call_count, requested_tokens, actual_tokens
         with lock:
-            if call_count >= route.max_calls:
+            if call_count >= effective_max_calls:
+                return None
+            remaining_wall = route.max_wall_seconds - (time.monotonic() - started_at)
+            if remaining_wall <= 0:
                 return None
             remaining = route.max_total_output_tokens - requested_tokens
             if remaining <= 0:
@@ -244,10 +299,16 @@ def execute_review(
             budget = min(selected.output_budget, remaining, item.output_limit)
             if budget <= 0:
                 return None
-            selected = replace(selected, output_budget=budget)
+            selected = replace(
+                selected,
+                output_budget=budget,
+                timeout_seconds=min(selected.timeout_seconds, max(0.001, remaining_wall)),
+            )
             call_count += 1
             requested_tokens += budget
         response = caller(item, selected, prompt, STRUCTURED_REVIEW_SYSTEM)
+        if time.monotonic() - started_at > route.max_wall_seconds:
+            response = replace(response, text="", status="wall_time_exceeded")
         with lock:
             actual_tokens += max(0, response.completion_tokens)
             observed_semantics = (
@@ -277,9 +338,15 @@ def execute_review(
             return {"status": "failed", "reason": "no_reviewer_for_chunking", "call_count": 0}
         selected = route.reviewers[0]
         item = profiles_by_alias[selected.alias]
-        safe_input_tokens = max(1, int(item.context_limit * 0.5) - selected.output_budget)
-        chunks = chunk_plan(plan, max_chars=max(1000, safe_input_tokens * 2))
-        if len(chunks) > route.max_calls:
+        try:
+            chunks = _chunks_for_profile(plan, item, selected)
+        except ValueError as exc:
+            return {
+                "status": "resource_limit",
+                "reason": str(exc),
+                "call_count": 0,
+            }
+        if len(chunks) > effective_max_calls:
             return {
                 "status": "resource_limit",
                 "reason": "chunk_count_exceeds_max_calls",
@@ -299,10 +366,14 @@ def execute_review(
                 chunk_reviews.append(parse_review(response.text))
             except ValueError as exc:
                 invalid_chunks.append({"chunk": index, "status": "invalid_review", "error": str(exc)})
-        if not chunk_reviews:
+        if invalid_chunks:
             return {
-                "status": "failed",
-                "reason": "all_chunks_failed",
+                "status": "resource_limit" if any(
+                    item["status"] == "wall_time_exceeded" for item in invalid_chunks
+                ) else "failed",
+                "reason": "wall_time_exceeded" if any(
+                    item["status"] == "wall_time_exceeded" for item in invalid_chunks
+                ) else "required_chunk_failed",
                 "call_count": call_count,
                 "calls": call_records,
                 "invalid_reviews": invalid_chunks,
@@ -347,23 +418,57 @@ def execute_review(
         item = profiles_by_alias[alias]
         semantics_confirmed_by_response = bool(
             response is not None
-            and response.status == "reasoning_budget_exhausted"
-            and response.reasoning_tokens >= int(selected.output_budget * 0.9)
+            and (
+                (
+                    response.status == "reasoning_budget_exhausted"
+                    and response.reasoning_tokens >= int(selected.output_budget * 0.9)
+                )
+                or (
+                    response.status == "incomplete_review"
+                    and response.completion_tokens >= int(selected.output_budget * 0.9)
+                )
+            )
+        )
+        semantics_confirmed_by_metadata = bool(
+            item.source != "name_heuristic" and item.token_semantics != "unknown"
         )
         if (
             response is not None
             and response.status in retry_statuses
             and confirmed
-            and (item.source != "name_heuristic" or semantics_confirmed_by_response)
-            and item.token_semantics != "unknown"
-            and call_count < route.max_calls
+            and (semantics_confirmed_by_metadata or semantics_confirmed_by_response)
+            and call_count < effective_max_calls
         ):
-            expanded = replace(selected, output_budget=min(item.output_limit, selected.output_budget * 2))
-            retried = invoke(item, expanded, prompt)
-            if retried is not None:
-                response = retried
+            expanded_budget = min(item.output_limit, selected.output_budget * 2)
+            if expanded_budget > selected.output_budget:
+                expanded = replace(selected, output_budget=expanded_budget)
+                retried = invoke(item, expanded, prompt)
+                if retried is not None:
+                    response = retried
         if response is not None:
             final_responses[alias] = response
+
+    adaptive_statuses = retry_statuses | {"input_context_overflow"}
+    if any(response.status == "wall_time_exceeded" for response in final_responses.values()):
+        return {
+            "status": "resource_limit",
+            "reason": "wall_time_exceeded",
+            "call_count": call_count,
+            "requested_output_tokens": requested_tokens,
+            "completion_tokens": actual_tokens,
+            "calls": call_records,
+        }
+    if not confirmed and any(
+        response.status in adaptive_statuses for response in final_responses.values()
+    ):
+        return {
+            "status": "confirmation_required",
+            "reason": "runtime_retry_or_chunking_requires_confirmation",
+            "call_count": call_count,
+            "requested_output_tokens": requested_tokens,
+            "completion_tokens": actual_tokens,
+            "calls": call_records,
+        }
 
     parsed = []
     parsed_by_alias = {}
@@ -387,25 +492,54 @@ def execute_review(
     runtime_overflow = any(
         response.status == "input_context_overflow" for response in final_responses.values()
     )
-    if not parsed and (retry_exhausted or runtime_overflow) and call_count < route.max_calls and route.reviewers:
+    if not parsed and (retry_exhausted or runtime_overflow) and call_count < effective_max_calls and route.reviewers:
         selected = route.reviewers[0]
         item = profiles_by_alias[selected.alias]
-        safe_input_tokens = max(1, int(item.context_limit * 0.5) - selected.output_budget)
-        chunks = chunk_plan(plan, max_chars=max(1000, safe_input_tokens * 2))
-        remaining_calls = route.max_calls - call_count
+        try:
+            chunks = _chunks_for_profile(plan, item, selected)
+        except ValueError as exc:
+            return {
+                "status": "resource_limit",
+                "reason": str(exc),
+                "call_count": call_count,
+                "requested_output_tokens": requested_tokens,
+                "completion_tokens": actual_tokens,
+                "calls": call_records,
+                "invalid_reviews": invalid,
+            }
+        remaining_calls = effective_max_calls - call_count
         if len(chunks) <= remaining_calls:
             chunk_fallback_used = True
+            runtime_chunk_invalid = []
             for index, chunk in enumerate(chunks, 1):
                 response = invoke(item, selected, _review_prompt(chunk))
                 if response is None or response.status != "success":
-                    invalid.append(
-                        {"chunk": index, "status": response.status if response else "resource_limit"}
-                    )
+                    entry = {
+                        "chunk": index,
+                        "status": response.status if response else "resource_limit",
+                    }
+                    invalid.append(entry)
+                    runtime_chunk_invalid.append(entry)
                     continue
                 try:
                     parsed.append(parse_review(response.text))
                 except ValueError as exc:
-                    invalid.append({"chunk": index, "status": "invalid_review", "error": str(exc)})
+                    entry = {"chunk": index, "status": "invalid_review", "error": str(exc)}
+                    invalid.append(entry)
+                    runtime_chunk_invalid.append(entry)
+            if runtime_chunk_invalid:
+                wall_exceeded = any(
+                    entry["status"] == "wall_time_exceeded" for entry in runtime_chunk_invalid
+                )
+                return {
+                    "status": "resource_limit" if wall_exceeded else "failed",
+                    "reason": "wall_time_exceeded" if wall_exceeded else "required_chunk_failed",
+                    "call_count": call_count,
+                    "requested_output_tokens": requested_tokens,
+                    "completion_tokens": actual_tokens,
+                    "calls": call_records,
+                    "invalid_reviews": invalid,
+                }
         else:
             return {
                 "status": "resource_limit",
@@ -445,7 +579,7 @@ def execute_review(
             }
         used = set(parsed_by_alias)
         judge = review_router.select_judge(profiles, used, route.assessment) if route.conflict_judge else None
-        if judge is not None and call_count < route.max_calls:
+        if judge is not None and call_count < effective_max_calls:
             estimate = review_router.TIER_LATENCY["critical"]
             judge_choice = review_router.ReviewerChoice(
                 alias=judge.alias,

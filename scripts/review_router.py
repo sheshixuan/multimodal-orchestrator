@@ -33,6 +33,7 @@ TIER_LATENCY = {
     "critical": (240.0, 900.0),
 }
 EFFORT_ORDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 VALID_TOKEN_SEMANTICS = {"answer_only", "combined", "separate", "unknown"}
 
 
@@ -225,6 +226,8 @@ def routing_config(cfg: dict[str, Any]) -> dict[str, Any]:
         value = result[key]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ConfigError(f"review_routing.{key} 必须是正整数")
+    if result["max_calls"] > 3:
+        raise ConfigError("review_routing.max_calls 不能超过硬上限 3")
     if result["mode"] not in ("auto", "manual"):
         raise ConfigError("review_routing.mode 仅支持 auto/manual")
     if result["long_plan_strategy"] != "adaptive_then_chunk":
@@ -391,6 +394,17 @@ def _latency_for(profile: CapabilityProfile, tier: str) -> tuple[float, float]:
     return (profile.p50_seconds or default_p50, profile.p90_seconds or default_p90)
 
 
+def _quality_rank(profile: CapabilityProfile, tier: str) -> tuple[float, int, float, int, float]:
+    max_effort = max((EFFORT_ORDER.get(item, 0) for item in profile.effort_levels), default=0)
+    return (
+        profile.quality,
+        max_effort,
+        profile.success_rate,
+        CONFIDENCE_ORDER.get(profile.confidence, 0),
+        -_latency_for(profile, tier)[1],
+    )
+
+
 def _choice(profile: CapabilityProfile, tier: str, routing: dict[str, Any]) -> ReviewerChoice:
     estimate = _latency_for(profile, tier)
     tier_budget = TIER_BUDGETS[tier]
@@ -438,19 +452,22 @@ def select_route(assessment: Assessment, profiles: list[CapabilityProfile], cfg:
         else:
             ranked = sorted(
                 eligible,
-                key=lambda item: (-item.quality, -item.success_rate, item.p90_seconds or float("inf"), item.alias),
+                key=lambda item: tuple(-value for value in _quality_rank(item, assessment.tier)) + (item.alias,),
             )
             selected = [ranked[0]]
             if assessment.tier == "critical" and len(ranked) > 1 and not needs_chunking:
                 first = ranked[0]
+                diverse_family = [item for item in ranked[1:] if item.family != first.family]
+                candidates = diverse_family or ranked[1:]
+                diverse_provider = [item for item in candidates if item.provider != first.provider]
+                candidates = diverse_provider or candidates
                 selected.append(
                     max(
-                        ranked[1:],
+                        candidates,
                         key=lambda item: (
-                            int(item.provider != first.provider) + int(item.family != first.family),
-                            item.quality,
-                            item.success_rate,
-                            -(item.p90_seconds or TIER_LATENCY["critical"][1]),
+                            *_quality_rank(item, "critical")[:-1],
+                            int(item.provider != first.provider),
+                            _quality_rank(item, "critical")[-1],
                         ),
                     )
                 )
@@ -493,7 +510,7 @@ def select_judge(
         eligible,
         key=lambda item: (
             item.quality,
-            {"low": 0, "medium": 1, "high": 2}.get(item.confidence, 0),
+            CONFIDENCE_ORDER.get(item.confidence, 0),
             int(item.provider not in used_providers),
             -(item.p90_seconds or TIER_LATENCY.get(assessment.tier, TIER_LATENCY["critical"])[1]),
         ),

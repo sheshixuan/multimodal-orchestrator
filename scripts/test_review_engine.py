@@ -6,6 +6,7 @@ import json
 import sys
 import time
 import unittest
+import unittest.mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -152,12 +153,24 @@ POST /v2/items。
 # 实现 B
 细节 B。
 """
-        chunks = self.engine.chunk_plan(plan, max_chars=90)
+        plan += "\n# 实现 C\n" + "更多细节。" * 30
+        chunks = self.engine.chunk_plan(plan, max_chars=240)
         self.assertGreaterEqual(len(chunks), 2)
         constraints = chunks[0].split("\n\n## 当前评审分片", 1)[0]
         for chunk in chunks:
             self.assertTrue(chunk.startswith(constraints))
             self.assertIn("旧客户端继续工作", chunk)
+
+    def test_chunking_splits_a_single_oversized_section(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        plan = "# 目标\nok\n# 实现\n" + "中" * 10000
+
+        chunks = self.engine.chunk_plan(plan, max_chars=1000)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 1000 for chunk in chunks))
 
 
 class TestReviewExecution(unittest.TestCase):
@@ -189,6 +202,90 @@ class TestReviewExecution(unittest.TestCase):
         self.assertEqual(output["status"], "success")
         self.assertEqual(output["call_count"], 2)
 
+    def test_retry_timeout_is_capped_by_remaining_task_wall_time(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        primary = profile("primary", "provider-a", "family-a")
+        selected_route = replace(
+            route([primary], tier="complex"),
+            max_wall_seconds=100,
+        )
+        clock = [0.0]
+        timeouts = []
+
+        def caller(item, selected, prompt, system):
+            timeouts.append(selected.timeout_seconds)
+            if len(timeouts) == 1:
+                clock[0] += 80.0
+                return result(status="reasoning_budget_exhausted", tokens=selected.output_budget)
+            clock[0] += 10.0
+            return result(structured_review("pass"))
+
+        with unittest.mock.patch.object(
+            self.engine.time, "monotonic", side_effect=lambda: clock[0]
+        ):
+            output = self.engine.execute_review(
+                "plan", selected_route, [primary], caller, confirmed=True
+            )
+
+        self.assertEqual(timeouts, [100, 20])
+        self.assertEqual(output["status"], "success")
+
+    def test_caller_overrun_of_remaining_wall_time_returns_resource_limit(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        primary = profile("primary", "provider-a", "family-a")
+        selected_route = replace(route([primary], tier="complex"), max_wall_seconds=1)
+        clock = [0.0]
+        calls = []
+
+        def caller(item, selected, prompt, system):
+            calls.append(selected.timeout_seconds)
+            clock[0] += 0.61
+            if len(calls) == 1:
+                return result(status="reasoning_budget_exhausted", tokens=selected.output_budget)
+            return result(structured_review("pass"))
+
+        with unittest.mock.patch.object(
+            self.engine.time, "monotonic", side_effect=lambda: clock[0]
+        ):
+            output = self.engine.execute_review(
+                "plan", selected_route, [primary], caller, confirmed=True
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output["status"], "resource_limit")
+        self.assertEqual(output["reason"], "wall_time_exceeded")
+
+    def test_unconfirmed_runtime_adaptation_stops_after_first_call(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        primary = profile("primary", "provider-a", "family-a")
+        selected_route = replace(
+            route([primary], tier="routine"),
+            requires_confirmation=False,
+            confirmation_reasons=(),
+        )
+        calls = []
+
+        def caller(item, selected, prompt, system):
+            calls.append(item.alias)
+            return result(
+                status="reasoning_budget_exhausted",
+                tokens=selected.output_budget,
+            )
+
+        output = self.engine.execute_review(
+            "plan", selected_route, [primary], caller, confirmed=False
+        )
+
+        self.assertEqual(calls, ["primary"])
+        self.assertEqual(output["status"], "confirmation_required")
+        self.assertEqual(output["call_count"], 1)
+
     def test_observed_reasoning_exhaustion_confirms_low_confidence_semantics(self):
         self.assertIsNotNone(self.engine, "review_engine module is required")
         if self.engine is None:
@@ -196,6 +293,7 @@ class TestReviewExecution(unittest.TestCase):
         inferred = profile(
             "inferred", "provider-a", "family-a", source="name_heuristic"
         )
+        inferred = replace(inferred, token_semantics="unknown")
         calls = []
 
         def caller(item, selected, prompt, system):
@@ -209,6 +307,29 @@ class TestReviewExecution(unittest.TestCase):
         )
 
         self.assertEqual(calls, [32000, 64000])
+        self.assertEqual(output["status"], "success")
+
+    def test_observed_incomplete_output_confirms_low_confidence_semantics(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        inferred = replace(
+            profile("inferred", "provider-a", "family-a", source="name_heuristic"),
+            token_semantics="unknown",
+        )
+        budgets = []
+
+        def caller(item, selected, prompt, system):
+            budgets.append(selected.output_budget)
+            if len(budgets) == 1:
+                return result(status="incomplete_review", tokens=selected.output_budget)
+            return result(structured_review("pass"))
+
+        output = self.engine.execute_review(
+            "plan", route([inferred], tier="complex"), [inferred], caller, confirmed=True
+        )
+
+        self.assertEqual(budgets, [32000, 64000])
         self.assertEqual(output["status"], "success")
 
     def test_conflict_uses_one_unused_model_as_terminal_judge(self):
@@ -295,18 +416,18 @@ class TestReviewExecution(unittest.TestCase):
             return
         primary = replace(
             profile("primary", "provider-a", "family-a"),
-            context_limit=900,
-            output_limit=200,
+            context_limit=6000,
+            output_limit=500,
         )
         selected_route = replace(
             route([primary], tier="critical"),
-            reviewers=(choice(primary, budget=200),),
+            reviewers=(choice(primary, budget=500),),
             needs_chunking=True,
         )
         plan = (
             "# 目标\n安全上线。\n# 验收标准\n旧客户端继续工作。\n"
-            "# 模块 A\n" + "A 细节。" * 150 + "\n"
-            "# 模块 B\n" + "B 细节。" * 150 + "\n"
+            "# 模块 A\n" + "A 细节。" * 400 + "\n"
+            "# 模块 B\n" + "B 细节。" * 400 + "\n"
         )
         prompts = []
 
@@ -323,6 +444,63 @@ class TestReviewExecution(unittest.TestCase):
         self.assertLessEqual(output["call_count"], 3)
         for prompt in prompts:
             self.assertIn("旧客户端继续工作", prompt)
+
+    def test_any_failed_required_chunk_prevents_overall_success(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        primary = replace(
+            profile("primary", "provider-a", "family-a"),
+            context_limit=6000,
+            output_limit=500,
+        )
+        selected_route = replace(
+            route([primary], tier="critical"),
+            reviewers=(choice(primary, budget=500),),
+            needs_chunking=True,
+        )
+        plan = (
+            "# 目标\n安全上线。\n# 验收标准\n旧客户端继续工作。\n"
+            "# 模块 A\n" + "A 细节。" * 400 + "\n"
+            "# 模块 B\n" + "B 细节。" * 400 + "\n"
+        )
+        calls = []
+
+        def caller(item, selected, prompt, system):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return result(structured_review("pass"))
+            return result(status="incomplete_review", tokens=selected.output_budget)
+
+        output = self.engine.execute_review(
+            plan, selected_route, [primary], caller, confirmed=True
+        )
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertNotEqual(output["status"], "success")
+
+    def test_executor_never_uses_more_than_three_calls_even_for_manual_route(self):
+        self.assertIsNotNone(self.engine, "review_engine module is required")
+        if self.engine is None:
+            return
+        first = profile("first", "provider-a", "family-a")
+        second = profile("second", "provider-b", "family-b")
+        unsafe_route = replace(route([first, second], max_calls=3), max_calls=9)
+        calls = []
+
+        def caller(item, selected, prompt, system):
+            calls.append(item.alias)
+            return result(
+                status="reasoning_budget_exhausted",
+                tokens=selected.output_budget,
+            )
+
+        output = self.engine.execute_review(
+            "plan", unsafe_route, [first, second], caller, confirmed=True
+        )
+
+        self.assertLessEqual(len(calls), 3)
+        self.assertLessEqual(output["call_count"], 3)
 
 
 if __name__ == "__main__":

@@ -559,7 +559,11 @@ def run_review(args):
             print(f"\n仲裁者：{output['adjudicated_by']}")
     else:
         print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)
-    return 0 if output.get("status") == "success" else 1
+    if output.get("status") == "success":
+        return 0
+    if output.get("status") == "confirmation_required":
+        return 4
+    return 1
 
 
 def run_assess(args, cfg, providers):

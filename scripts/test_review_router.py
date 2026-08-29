@@ -146,6 +146,88 @@ reasoning_levels = ["low"]
         self.assertEqual(assessment.tier, "blocked")
         self.assertTrue(assessment.blocking_reasons)
 
+    def test_critical_second_reviewer_must_use_a_different_family_when_available(self):
+        self.assertIsNotNone(self.router, "review_router module is required")
+        if self.router is None:
+            return
+
+        def candidate(alias, provider, family, quality):
+            return self.router.CapabilityProfile(
+                alias=alias,
+                configured_model=f"{provider}:{alias}",
+                provider=provider,
+                model=alias,
+                family=family,
+                modalities=("text",),
+                effort_levels=("high",),
+                reasoning_field="reasoning_effort",
+                context_limit=1000000,
+                output_limit=64000,
+                token_semantics="combined",
+                streaming=True,
+                quality=quality,
+                confidence="high",
+                source="config",
+                key_ready=True,
+            )
+
+        profiles = [
+            candidate("first", "provider-a", "family-a", 100),
+            candidate("same-family", "provider-b", "family-a", 99),
+            candidate("different-family", "provider-a", "family-b", 90),
+        ]
+        assessment = self.router.Assessment(80, 80, 80, 80, "critical", input_tokens=1000)
+
+        selected = self.router.select_route(assessment, profiles, {})
+
+        self.assertEqual(
+            [item.alias for item in selected.reviewers],
+            ["first", "different-family"],
+        )
+
+    def test_critical_prefers_a_different_provider_within_diverse_families(self):
+        self.assertIsNotNone(self.router, "review_router module is required")
+        if self.router is None:
+            return
+
+        def candidate(alias, provider, family, quality):
+            return self.router.CapabilityProfile(
+                alias=alias,
+                configured_model=f"{provider}:{alias}",
+                provider=provider,
+                model=alias,
+                family=family,
+                modalities=("text",),
+                effort_levels=("high",),
+                reasoning_field="reasoning_effort",
+                context_limit=1000000,
+                output_limit=64000,
+                token_semantics="combined",
+                streaming=True,
+                quality=quality,
+                confidence="high",
+                source="config",
+                key_ready=True,
+            )
+
+        profiles = [
+            candidate("first", "provider-a", "family-a", 100),
+            candidate("same-provider", "provider-a", "family-b", 99),
+            candidate("different-provider", "provider-b", "family-c", 90),
+        ]
+        assessment = self.router.Assessment(80, 80, 80, 80, "critical", input_tokens=1000)
+
+        selected = self.router.select_route(assessment, profiles, {})
+
+        self.assertEqual(
+            [item.alias for item in selected.reviewers],
+            ["first", "different-provider"],
+        )
+
+    def test_max_calls_above_hard_limit_is_rejected(self):
+        with self.assertRaises(call_model.ConfigError):
+            self.router.routing_config({"review_routing": {"max_calls": 4}})
+
     def test_name_inference_is_low_confidence_and_conservative(self):
         self.assertIsNotNone(self.router, "review_router module is required")
         if self.router is None:

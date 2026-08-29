@@ -403,11 +403,19 @@ def _usage_counts(usage):
     return int(completion or 0), int(reasoning or 0)
 
 
-def _result_status(text, finish_reason, saw_reasoning, completion_tokens, requested_budget):
+def _result_status(
+    text,
+    finish_reason,
+    saw_reasoning,
+    completion_tokens,
+    requested_budget,
+    reasoning_tokens=0,
+):
     if finish_reason == "length":
         if text:
             return "incomplete_review"
-        near_budget = not requested_budget or completion_tokens >= int(requested_budget * 0.9)
+        observed_tokens = max(completion_tokens, reasoning_tokens)
+        near_budget = not requested_budget or observed_tokens >= int(requested_budget * 0.9)
         if saw_reasoning and near_budget:
             return "reasoning_budget_exhausted"
         return "output_budget_exhausted"
@@ -429,7 +437,14 @@ def normalize_response(body, *, requested_budget=None, elapsed_seconds=0.0):
     finish = choice.get("finish_reason") if isinstance(choice, dict) else None
     return ModelCallResult(
         text=text,
-        status=_result_status(text, finish, saw_reasoning, completion, requested_budget),
+        status=_result_status(
+            text,
+            finish,
+            saw_reasoning,
+            completion,
+            requested_budget,
+            reasoning_tokens,
+        ),
         finish_reason=finish,
         completion_tokens=completion,
         reasoning_tokens=reasoning_tokens,
@@ -521,7 +536,14 @@ def parse_stream_response(
     text = "".join(content_parts)
     return ModelCallResult(
         text=text,
-        status=_result_status(text, finish_reason, saw_reasoning, completion, requested_budget),
+        status=_result_status(
+            text,
+            finish_reason,
+            saw_reasoning,
+            completion,
+            requested_budget,
+            reasoning_tokens,
+        ),
         finish_reason=finish_reason,
         completion_tokens=completion,
         reasoning_tokens=reasoning_tokens,
