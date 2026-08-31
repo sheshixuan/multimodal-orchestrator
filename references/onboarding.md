@@ -61,7 +61,7 @@
    如需显式指定 provider，模型名写成 `provider:model`（如 `opencode-zen:gemini-3.5-flash`）；
    如需自定义 provider，按 `references/model_presets.md` 增加 `[providers.xxx]`。
    `plan_review` 控制 Codex Plan 收尾评审门：`ask`（默认）表示每次 Plan 提交最终计划前
-   先用 `--assess` 生成建议路由，让用户接受、覆盖或跳过；
+   先用 `--assess` 生成建议路由，第一层只让用户选择单模型、多模型或跳过；推荐项随评分动态变化；
    `auto` 表示普通评审告知后自动开始，但慢任务、多模型、分片或扩容仍需确认；
    `off` 表示关闭。旧值 `true/false` 兼容为 `ask/off`。
 6. **安装 Plan 收尾评审门 hook**（Codex 宿主建议，默认询问是否安装）：

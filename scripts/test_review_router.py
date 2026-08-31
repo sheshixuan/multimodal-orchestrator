@@ -136,6 +136,81 @@ reasoning_levels = ["low"]
         self.assertEqual(route.max_calls, 3)
         self.assertEqual(route.max_total_output_tokens, 131072)
 
+    def test_single_strategy_limits_critical_plan_to_one_reviewer(self):
+        self.assertIsNotNone(self.router, "review_router module is required")
+        if self.router is None:
+            return
+
+        def candidate(alias, provider, family, quality):
+            return self.router.CapabilityProfile(
+                alias=alias,
+                configured_model=f"{provider}:{alias}",
+                provider=provider,
+                model=alias,
+                family=family,
+                modalities=("text",),
+                effort_levels=("high", "max"),
+                reasoning_field="reasoning_effort",
+                context_limit=1000000,
+                output_limit=384000,
+                token_semantics="combined",
+                streaming=True,
+                quality=quality,
+                confidence="high",
+                source="config",
+                key_ready=True,
+            )
+
+        assessment = self.router.Assessment(80, 75, 80, 78.2, "critical", input_tokens=1000)
+        profiles = [
+            candidate("first", "provider-a", "family-a", 96),
+            candidate("second", "provider-b", "family-b", 94),
+        ]
+
+        route = self.router.select_route(assessment, profiles, {}, strategy="single")
+
+        self.assertEqual([item.alias for item in route.reviewers], ["first"])
+
+    def test_multi_strategy_expands_routine_plan_to_two_diverse_reviewers(self):
+        self.assertIsNotNone(self.router, "review_router module is required")
+        if self.router is None:
+            return
+
+        def candidate(alias, provider, family, quality, p90):
+            return self.router.CapabilityProfile(
+                alias=alias,
+                configured_model=f"{provider}:{alias}",
+                provider=provider,
+                model=alias,
+                family=family,
+                modalities=("text",),
+                effort_levels=("low", "high"),
+                reasoning_field="reasoning_effort",
+                context_limit=1000000,
+                output_limit=64000,
+                token_semantics="combined",
+                streaming=True,
+                quality=quality,
+                confidence="high",
+                source="config",
+                key_ready=True,
+                p50_seconds=30,
+                p90_seconds=p90,
+            )
+
+        assessment = self.router.Assessment(15, 5, 5, 9.5, "routine", input_tokens=1000)
+        profiles = [
+            candidate("fast", "provider-a", "family-a", 80, 60),
+            candidate("diverse", "provider-b", "family-b", 78, 90),
+            candidate("same-family", "provider-c", "family-a", 79, 70),
+        ]
+
+        route = self.router.select_route(assessment, profiles, {}, strategy="multi")
+
+        self.assertEqual([item.alias for item in route.reviewers], ["fast", "diverse"])
+        self.assertTrue(route.requires_confirmation)
+        self.assertIn("需要并行调用多个外部评审模型", route.confirmation_reasons)
+
     def test_missing_decision_blocks_before_any_model_is_selected(self):
         self.assertIsNotNone(self.router, "review_router module is required")
         if self.router is None:

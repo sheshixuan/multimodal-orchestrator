@@ -96,7 +96,7 @@ python3 <skill_dir>/scripts/call_model.py --list-presets
 首次信任 hook：在 Codex 里运行 `/hooks`，然后重启 Codex 或新开任务。
 
 ```
-# 纯本地评估：输出评分、建议模型、推理档位、预计耗时和资源上限
+# 纯本地评估：输出评分、动态推荐的评审模式、建议模型、预计耗时和资源上限
 python3 <skill_dir>/scripts/review_plan.py --assess 计划.md --json
 
 # 查看/切换 Plan 收尾评审时机：off / ask / auto
@@ -106,9 +106,12 @@ python3 <skill_dir>/scripts/review_plan.py --set-plan-mode ask
 # 保存用户选择的评审模型（可跨任务复用）
 python3 <skill_dir>/scripts/review_plan.py --set-model kimi-k3
 
-# 使用自动路由评审；若退出码为 4，需先向用户确认慢任务
-python3 <skill_dir>/scripts/review_plan.py --review 计划.md
-python3 <skill_dir>/scripts/review_plan.py --review 计划.md --confirm-slow
+# 用户选择单模型或多模型后执行；若退出码为 4，需先确认慢任务
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md --strategy single
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md --strategy multi --confirm-slow
+
+# 用户选择跳过；不调用任何外部模型
+python3 <skill_dir>/scripts/review_plan.py --review 计划.md --strategy skip
 
 # 本次临时指定评审模型并附原图交叉核验
 python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
@@ -116,10 +119,10 @@ python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
 
 # 固定两个首轮评审者
 python3 <skill_dir>/scripts/review_plan.py --review 计划.md \
-  --reviewer provider-a:model-a --reviewer provider-b:model-b --confirm-slow
+  --strategy multi --reviewer provider-a:model-a --reviewer provider-b:model-b --confirm-slow
 ```
 
-`plan_review` 三档：`ask`（默认，展示计划与建议路由后让用户接受、覆盖或跳过）、
+`plan_review` 三档：`ask`（默认，第一层只展示单模型、多模型、跳过，并按方案评分动态推荐）、
 `auto`（普通评审告知后自动执行，慢任务仍确认）、`off`（关闭）。旧值 `true/false`
 兼容为 `ask/off`。`--assess` 不访问 API；多模型、预计超过 180 秒、分片或扩容必须加
 `--confirm-slow`。卸载 hook：`scripts/install_plan_hook.py --uninstall`。

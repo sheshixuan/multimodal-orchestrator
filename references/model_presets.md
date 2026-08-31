@@ -56,7 +56,7 @@ opencode_go = "glm-5.2"
 private_proxy = "myproxy:review-model"
 ```
 
-触发时机由 `config.toml` 的顶层 `plan_review` 控制：`ask`（默认，展示计划与建议路由后接受、覆盖或跳过）、
+触发时机由 `config.toml` 的顶层 `plan_review` 控制：`ask`（默认，按评分动态推荐单模型或多模型，用户也可跳过）、
 `auto`（普通评审告知后自动执行，慢任务仍确认）、`off`（关闭）；旧值 `true/false`
 兼容为 `ask/off`。能力覆盖、token 语义和预算配置见 `plan_review_routing.md`。
 

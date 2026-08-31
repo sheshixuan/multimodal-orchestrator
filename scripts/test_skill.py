@@ -767,6 +767,11 @@ class TestPlanReviewHook(unittest.TestCase):
         self.assertIn("实施计划", text)
         self.assertIn("建议路由", text)
         self.assertIn("跳过", text)
+        self.assertIn("单模型评审", text)
+        self.assertIn("多模型交叉评审", text)
+        self.assertIn("推荐标记", text)
+        self.assertIn("--strategy", text)
+        self.assertNotIn("接受自动路由", text)
 
     def test_auto_context(self):
         text = plan_review_hook.build_context({"plan_review": "auto"}, "plan")

@@ -107,6 +107,45 @@ token_semantics = "combined"
         payload = json.loads(stdout)
         self.assertEqual(payload["assessment"]["tier"], "critical")
         self.assertEqual(len(payload["route"]["reviewers"]), 2)
+        self.assertEqual(payload["review_strategy"]["recommended"], "multi")
+        self.assertEqual(
+            [item["id"] for item in payload["review_strategy"]["options"]],
+            ["single", "multi", "skip"],
+        )
+        self.assertTrue(payload["review_strategy"]["options"][1]["recommended"])
+        api_get.assert_not_called()
+
+    def test_routine_assessment_recommends_single_model_strategy(self):
+        self.plan.write_text("# 文案调整\n只修改 README 的一句说明。\n", encoding="utf-8")
+        with unittest.mock.patch.dict(
+            os.environ, {"ALPHA_KEY": "x", "BETA_KEY": "x"}, clear=True
+        ):
+            code, stdout, stderr = self._main(
+                [
+                    "--assess", str(self.plan), "--json",
+                    "--config", str(self.config), "--state", str(self.state),
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["assessment"]["tier"], "routine")
+        self.assertEqual(payload["review_strategy"]["recommended"], "single")
+        self.assertTrue(payload["review_strategy"]["options"][0]["recommended"])
+
+    def test_skip_strategy_never_calls_provider_or_model_api(self):
+        with unittest.mock.patch("call_model.call_chat") as call_chat:
+            with unittest.mock.patch("call_model.api_get") as api_get:
+                code, stdout, stderr = self._main(
+                    [
+                        "--review", str(self.plan), "--strategy", "skip", "--json",
+                        "--config", str(self.config), "--state", str(self.state),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["status"], "skipped")
+        call_chat.assert_not_called()
         api_get.assert_not_called()
 
     def test_slow_multi_model_review_requires_confirmation_before_api(self):

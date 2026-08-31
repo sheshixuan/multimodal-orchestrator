@@ -62,13 +62,16 @@ Codex 的 Plan 权限模式下注入指令，不会在普通任务里打扰。
 1. **完成实施计划**：先把草稿落盘，不要在内容完整前调用评审模型。
 2. **本地评估**：运行 `python3 <skill_dir>/scripts/review_plan.py --assess <计划文件> --json`。
    本步骤不访问外部 API；把评分依据、建议 provider/模型、推理档位、预计区间、硬超时、最坏调用次数和能力置信度告知用户。
-3. **处理门控**：`plan_review=ask` 时让用户接受自动路由、用 `--model`/可重复的 `--reviewer` 覆盖，或跳过；
-   `auto` 时普通评审在告知后开始。`--review` 返回退出码 4 时停止，只有用户确认后才加 `--confirm-slow` 重跑。
+3. **处理门控**：`plan_review=ask` 时，第一层只提供“单模型评审 / 多模型交叉评审 / 跳过评审”三个选项。
+   推荐项由 `--assess` 返回的 `review_strategy.recommended` 决定：`routine/complex` 推荐单模型，`critical`
+   推荐多模型；`blocked` 先补充关键信息，不调用 API。选择评审方式后，第二层再展示自动匹配的具体模型，
+   并允许用 `--model`/可重复的 `--reviewer` 调整。`auto` 时普通评审在告知后开始。`--review` 返回退出码 4
+   时停止，只有用户确认后才加 `--confirm-slow` 重跑。
 4. **评审与修订**：运行 `--review`；把统一 JSON 中的结论、问题、证据和建议并入计划。关键任务首轮并行占两个调用名额；第三次优先给按路由排序的失败评审者做一次已确认扩容，仅在无需重试且意见实质冲突时才调用未参与首轮的最强合格模型仲裁。无可用第三次调用时标记 `adjudicated_by=core`。
 
 控制与边界：
 - 顶层 `plan_review` 支持三档（缺失视为 `ask`；旧值 `true/false` 分别兼容为 `ask/off`）：
-  - `ask`（默认）：展示实施计划和建议路由后等待用户接受、覆盖或跳过。
+  - `ask`（默认）：展示实施计划后，根据本地评分动态推荐单模型或多模型；用户也可选择另一模式或跳过。
   - `auto`：普通评审告知后自动开始；超过三分钟、多模型、分片或扩容仍需确认。
   - `off`：完全关闭本门，hook 不注入任何指令。
 - 随时切换（无需重跑引导）：`python3 <skill_dir>/scripts/review_plan.py --set-plan-mode off|ask|auto`；

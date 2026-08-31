@@ -35,6 +35,7 @@ TIER_LATENCY = {
 EFFORT_ORDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 VALID_TOKEN_SEMANTICS = {"answer_only", "combined", "separate", "unknown"}
+VALID_REVIEW_STRATEGIES = {"auto", "single", "multi"}
 
 
 @dataclass(frozen=True)
@@ -426,7 +427,34 @@ def _choice(profile: CapabilityProfile, tier: str, routing: dict[str, Any]) -> R
     )
 
 
-def select_route(assessment: Assessment, profiles: list[CapabilityProfile], cfg: dict[str, Any]) -> ReviewRoute:
+def _select_second_reviewer(
+    first: CapabilityProfile,
+    eligible: list[CapabilityProfile],
+    tier: str,
+) -> CapabilityProfile:
+    remaining = [item for item in eligible if item.alias != first.alias]
+    diverse_family = [item for item in remaining if item.family != first.family]
+    candidates = diverse_family or remaining
+    diverse_provider = [item for item in candidates if item.provider != first.provider]
+    candidates = diverse_provider or candidates
+    return max(
+        candidates,
+        key=lambda item: (
+            *_quality_rank(item, tier)[:-1],
+            int(item.provider != first.provider),
+            _quality_rank(item, tier)[-1],
+        ),
+    )
+
+
+def select_route(
+    assessment: Assessment,
+    profiles: list[CapabilityProfile],
+    cfg: dict[str, Any],
+    strategy: str = "auto",
+) -> ReviewRoute:
+    if strategy not in VALID_REVIEW_STRATEGIES:
+        raise ConfigError(f"未知评审策略：{strategy}")
     routing = routing_config(cfg)
     if assessment.tier == "blocked":
         selected: list[CapabilityProfile] = []
@@ -447,6 +475,8 @@ def select_route(assessment: Assessment, profiles: list[CapabilityProfile], cfg:
         needs_chunking = not eligible
         if needs_chunking:
             eligible = key_ready
+        if strategy == "multi" and (len(eligible) < 2 or needs_chunking):
+            raise ConfigError("多模型交叉评审至少需要两个可容纳当前计划的合格模型")
         if assessment.tier == "routine":
             selected = [min(eligible, key=lambda item: ((_latency_for(item, "routine")[1]), -item.quality))]
         else:
@@ -455,22 +485,11 @@ def select_route(assessment: Assessment, profiles: list[CapabilityProfile], cfg:
                 key=lambda item: tuple(-value for value in _quality_rank(item, assessment.tier)) + (item.alias,),
             )
             selected = [ranked[0]]
-            if assessment.tier == "critical" and len(ranked) > 1 and not needs_chunking:
-                first = ranked[0]
-                diverse_family = [item for item in ranked[1:] if item.family != first.family]
-                candidates = diverse_family or ranked[1:]
-                diverse_provider = [item for item in candidates if item.provider != first.provider]
-                candidates = diverse_provider or candidates
-                selected.append(
-                    max(
-                        candidates,
-                        key=lambda item: (
-                            *_quality_rank(item, "critical")[:-1],
-                            int(item.provider != first.provider),
-                            _quality_rank(item, "critical")[-1],
-                        ),
-                    )
-                )
+        wants_multiple = strategy == "multi" or (
+            strategy == "auto" and assessment.tier == "critical"
+        )
+        if wants_multiple and len(eligible) > 1 and not needs_chunking:
+            selected.append(_select_second_reviewer(selected[0], eligible, assessment.tier))
 
     choices = tuple(_choice(item, assessment.tier, routing) for item in selected)
     reasons = []

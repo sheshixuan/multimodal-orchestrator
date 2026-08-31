@@ -11,20 +11,30 @@
    ```
 
 2. 告知用户评分依据、模型/provider、推理档位、预计 P50–P90、硬超时、调用/token 上限和能力置信度。
-3. 普通单模型评审可在告知后执行。多模型、预计超过 180 秒、分片或预算扩容必须先确认：
+3. `plan_review=ask` 的第一层只展示三种评审方式：单模型评审、多模型交叉评审、跳过评审。
+   `review_strategy.recommended` 根据本地评分动态移动推荐标记，不把具体模型作为同层选项：
+
+   - `routine` / `complex`：推荐单模型。
+   - `critical`：推荐多模型。
+   - `blocked`：先补充会改变方案方向的关键信息，不推荐或调用外部模型。
+
+   用户选择单模型或多模型后，第二层再展示具体模型/provider，并允许调整。
+4. 普通单模型评审可在告知后执行。多模型、预计超过 180 秒、分片或预算扩容必须先确认：
 
    ```bash
-   python3 scripts/review_plan.py --review plan.md --confirm-slow
+   python3 scripts/review_plan.py --review plan.md --strategy single
+   python3 scripts/review_plan.py --review plan.md --strategy multi --confirm-slow
    ```
 
-4. 用户可覆盖自动结果：
+5. 用户可覆盖自动结果：
 
    ```bash
    python3 scripts/review_plan.py --review plan.md --model provider:model
    python3 scripts/review_plan.py --review plan.md \
-     --reviewer provider-a:model-a --reviewer provider-b:model-b
+     --strategy multi --reviewer provider-a:model-a --reviewer provider-b:model-b
    ```
 
+`--strategy single|multi` 使第一层模式选择成为实际路由约束；`--strategy skip` 不调用外部 API。
 `--model` 强制单评审者；可重复的 `--reviewer` 固定首轮评审者。`--effort` 和 `--timeout`
 只覆盖本次调用；推理档位必须存在于模型能力档案中。需要确认但未传 `--confirm-slow` 时退出码为 4，且不调用外部 API。
 

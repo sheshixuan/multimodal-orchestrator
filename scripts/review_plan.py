@@ -12,6 +12,9 @@
   python3 review_plan.py --assess 计划.md --json
   python3 review_plan.py --set-model kimi-k3
   python3 review_plan.py --review 计划.md
+  python3 review_plan.py --review 计划.md --strategy single
+  python3 review_plan.py --review 计划.md --strategy multi --confirm-slow
+  python3 review_plan.py --review 计划.md --strategy skip
   python3 review_plan.py --review 计划.md --confirm-slow
   python3 review_plan.py --review 计划.md --model opencode-zen:gemini-3.1-pro --image 原图.png
 
@@ -61,6 +64,7 @@ REVIEW_MODELS = [
 ]
 
 PLAN_MODES = ("off", "ask", "auto")
+REVIEW_STRATEGIES = ("single", "multi", "skip")
 
 _KEY_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*=")
 
@@ -261,15 +265,69 @@ def _apply_latency(profiles, state, tier):
     return updated
 
 
-def assess_review(plan, cfg, providers, state=None):
+def assess_review(plan, cfg, providers, state=None, strategy="auto"):
     """纯本地评估；不会访问 provider、目录或模型 API。"""
     state = state or {}
     assessment = review_router.assess_plan(plan)
     profiles = review_router.build_capability_profiles(cfg, providers)
     profiles = review_router.apply_capability_metadata(profiles, _cached_metadata(state))
     profiles = _apply_latency(profiles, state, assessment.tier)
-    route = review_router.select_route(assessment, profiles, cfg)
+    route = review_router.select_route(assessment, profiles, cfg, strategy=strategy)
     return assessment, profiles, route
+
+
+def review_strategy_payload(assessment):
+    if assessment.tier == "critical":
+        recommended = "multi"
+        reason = (
+            "难度、不确定性、风险任一项或综合分达到关键阈值，"
+            "建议使用两个独立模型交叉检查。"
+        )
+    elif assessment.tier == "complex":
+        recommended = "single"
+        reason = "方案需要质量优先评审，但尚未达到关键阈值，建议使用一个高质量模型。"
+    elif assessment.tier == "routine":
+        recommended = "single"
+        reason = "方案复杂度和风险较低，单模型评审通常能以更短时间完成检查。"
+    else:
+        recommended = None
+        reason = "计划存在会改变方案方向的待定事项，请先补充关键信息再选择评审方式。"
+
+    options = [
+        {
+            "id": "single",
+            "label": "单模型评审",
+            "description": "自动匹配一个合格模型；下一步可查看或调整具体模型。",
+        },
+        {
+            "id": "multi",
+            "label": "多模型交叉评审",
+            "description": "自动匹配两个尽量不同家族和 provider 的模型；需要额外确认。",
+        },
+        {
+            "id": "skip",
+            "label": "跳过评审",
+            "description": "不调用任何外部模型，直接提交当前计划。",
+        },
+    ]
+    for option in options:
+        option["recommended"] = option["id"] == recommended
+    return {
+        "recommended": recommended,
+        "reason": reason,
+        "requires_resolution": assessment.tier == "blocked",
+        "options": options,
+    }
+
+
+def _requested_strategy(args, requested):
+    if args.strategy:
+        return args.strategy
+    if len(requested) > 1:
+        return "multi"
+    if requested:
+        return "single"
+    return "auto"
 
 
 def _cache_profiles(state, profiles):
@@ -401,6 +459,13 @@ def run_review(args):
             print("--model 与 --reviewer 不能同时使用", file=sys.stderr)
             return 3
         requested = [args.model]
+    strategy = _requested_strategy(args, requested)
+    if strategy == "single" and len(requested) > 1:
+        print("单模型评审只能指定一个 --reviewer", file=sys.stderr)
+        return 3
+    if strategy == "multi" and requested and len(requested) < 2:
+        print("多模型交叉评审需要至少两个 --reviewer，或不指定模型让系统自动匹配", file=sys.stderr)
+        return 3
     cfg = _explicit_config(cfg, requested)
     try:
         providers = build_providers(cfg)
@@ -408,7 +473,7 @@ def run_review(args):
         if args.prompt:
             plan = args.prompt.strip() + "\n\n" + plan
         state = review_router.load_runtime_state(args.state)
-        assessment, profiles, route = assess_review(plan, cfg, providers, state)
+        assessment, profiles, route = assess_review(plan, cfg, providers, state, strategy)
         route = _override_route(route, profiles, args.effort, args.timeout)
     except (ConfigError, OSError) as exc:
         print(str(exc), file=sys.stderr)
@@ -444,7 +509,7 @@ def run_review(args):
         catalog_url=catalog_url if isinstance(catalog_url, str) else DEFAULT_CATALOG_URL,
     )
     try:
-        route = review_router.select_route(assessment, profiles, cfg)
+        route = review_router.select_route(assessment, profiles, cfg, strategy=strategy)
         route = _override_route(route, profiles, args.effort, args.timeout)
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
@@ -573,11 +638,16 @@ def run_assess(args, cfg, providers):
             if requested:
                 raise ConfigError("--model 与 --reviewer 不能同时使用")
             requested = [args.model]
+        strategy = _requested_strategy(args, requested)
+        if strategy == "single" and len(requested) > 1:
+            raise ConfigError("单模型评审只能指定一个 --reviewer")
+        if strategy == "multi" and requested and len(requested) < 2:
+            raise ConfigError("多模型交叉评审需要至少两个 --reviewer，或不指定模型让系统自动匹配")
         cfg = _explicit_config(cfg, requested)
         providers = build_providers(cfg)
         plan = call_model.read_plan_source(args.assess)
         state = review_router.load_runtime_state(args.state)
-        assessment, profiles, route = assess_review(plan, cfg, providers, state)
+        assessment, profiles, route = assess_review(plan, cfg, providers, state, strategy)
         route = _override_route(route, profiles, args.effort, args.timeout)
     except (ConfigError, OSError) as exc:
         print(str(exc), file=sys.stderr)
@@ -585,6 +655,7 @@ def run_assess(args, cfg, providers):
     payload = {
         "assessment": assessment.to_dict(),
         "route": route.to_dict(),
+        "review_strategy": review_strategy_payload(assessment),
         "capabilities": [item.to_dict() for item in profiles],
     }
     if args.json:
@@ -611,6 +682,11 @@ def main(argv=None):
     parser.add_argument("--assess", metavar="PLAN", help="纯本地评估并输出建议路由，不调用外部 API")
     parser.add_argument("--model", help="本次评审使用的模型；缺省读 config.toml 的 review_model")
     parser.add_argument("--reviewer", action="append", default=[], help="显式评审模型，可重复")
+    parser.add_argument(
+        "--strategy",
+        choices=REVIEW_STRATEGIES,
+        help="评审方式：single / multi / skip",
+    )
     parser.add_argument(
         "--effort",
         choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -641,6 +717,20 @@ def main(argv=None):
             "请从 --list-models / --set-model / --plan-mode / "
             "--set-plan-mode / --assess / --review 中选择一个操作"
         )
+
+    if args.strategy == "skip":
+        if not args.review:
+            print("--strategy skip 仅可与 --review 一起使用", file=sys.stderr)
+            return 3
+        if args.model or args.reviewer or args.effort or args.timeout or args.confirm_slow:
+            print("跳过评审时不能同时指定模型、推理档位、超时或慢任务确认", file=sys.stderr)
+            return 3
+        payload = {"status": "skipped", "strategy": "skip"}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("已跳过 Plan Review；未调用任何外部模型。")
+        return 0
 
     cfg = load_config(args.config)
     try:
